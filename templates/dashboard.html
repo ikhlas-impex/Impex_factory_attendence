@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IMPEX Attendance System</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body>
+    <!-- Main Container -->
+    <div class="main-container">
+        <!-- Left Panel - Camera Feed -->
+            <div class="camera-panel">
+                <div class="video-container">
+                    <img id="videoStream" src="{{ url_for('video_feed') }}" alt="Camera Feed">
+                    <div class="camera-overlay">
+                        <img src="{{ url_for('static', filename='icons/impex.png') }}" alt="impex" class="overlay-logo overlay-logo-impex">
+                        <img src="{{ url_for('static', filename='icons/live.png') }}" alt="Live" class="overlay-logo overlay-logo-live">
+                        <div class="camera-status">
+                            <span id="cameraStatus">Camera Disconnected</span>
+                        </div>
+                    </div>
+                </div>
+            <div class="controls">
+                <button id="startBtn" class="btn btn-start" onclick="startSystem()">
+                    <span class="btn-icon">▶</span> Start
+                </button>
+                <button id="stopBtn" class="btn btn-stop" onclick="stopSystem()">
+                    <span class="btn-icon">■</span> Stop
+                </button>
+            </div>
+        </div>
+
+        <!-- Right Panel - Attendance -->
+        <div class="attendance-panel">
+            <div class="attendance-header">
+                <img 
+                    id="titleLabel" 
+                    src="{{ url_for('static', filename='icons/Check In.png' if view_mode == 'checkin' else 'icons/Check Out.png') }}" 
+                    alt="{{ 'Check In' if view_mode == 'checkin' else 'Check Out' }}" 
+                    class="title-image">
+                <div class="date-time">
+                    <div id="dateLabel" class="date"></div>
+                    <div id="timeLabel" class="time"></div>
+                </div>
+                
+                <!-- Mode Toggle (only if not locked) -->
+                {% if not is_locked %}
+                <div class="mode-toggle">
+                    <button class="mode-btn" onclick="setMode('checkin')">Check In</button>
+                    <button class="mode-btn" onclick="setMode('checkout')">Check Out</button>
+                </div>
+                {% endif %}
+            </div>
+
+            <!-- Checked-out Cards -->
+            <div class="cards-section">
+                <div class="cards-container" id="checkedOutContainer">
+                    <!-- Checked-out cards will be injected here -->
+                </div>
+            </div>
+
+            <!-- Remaining Cards -->
+            <div class="cards-section remaining-section">
+                <div class="remaining-header">
+                    <span id="remainingCount">REMAINING : 0</span>
+                </div>
+                <div class="cards-container remaining" id="remainingContainer">
+                    <!-- Remaining cards will be injected here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Banner at Bottom -->
+    <div class="banner">
+        <img src="{{ url_for('static', filename='icons/banner_down.png') }}" alt="POWERED BY INNOVATION & INDUSTRY 4.0 DEPARTMENT" class="banner-image">
+    </div>
+
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+    <script>
+        // Initialize system mode
+        const SYSTEM_MODE = '{{ system_mode }}';
+        const IS_LOCKED = {{ 'true' if is_locked else 'false' }};
+        const PAGE_MODE = '{{ view_mode if view_mode else system_mode }}'; // page intent (checkin/checkout)
+        
+        // Initialize dashboard when page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            initDashboard();
+        });
+    </script>
+</body>
+</html>
+

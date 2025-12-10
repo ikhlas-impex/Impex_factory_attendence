@@ -1,0 +1,7 @@
+{
+    "system_mode": "checkout",
+    "system_name": "IMPEX Check-Out System",
+    "database_path": "data/factory_attendance.db",
+    "allow_mode_switch": false,
+    "locked_mode": true
+}

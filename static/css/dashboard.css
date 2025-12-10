@@ -1,0 +1,445 @@
+/* IMPEX Attendance Dashboard - Web Styles */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Arial', sans-serif;
+    background: #000000;
+    color: white;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Banner - Positioned at Bottom */
+.banner {
+    background: #000000;
+    padding: 10px 20px;
+    text-align: center;
+    border-top: 2px solid rgba(255, 144, 30, 0.5);
+    z-index: 1000;
+    flex-shrink: 0;
+    order: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.banner-image {
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    object-fit: contain;
+    display: block;
+}
+
+/* Main Container */
+.main-container {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    gap: 5px;
+    padding: 5px;
+    order: 1;
+    background: #000000;
+}
+
+/* Camera Panel */
+.camera-panel {
+    flex: 1.2;
+    background: rgba(0, 0, 0, 0.9);
+    border-radius: 10px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    background-image: url('/static/icons/Vector.png');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+
+.video-container {
+    flex: 1;
+    position: relative;
+    background: black;
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 400px;
+}
+
+#videoStream {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    max-width: 100%;
+    max-height: 100%;
+}
+
+.camera-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    pointer-events: none;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 10px;
+}
+
+.overlay-logo {
+    position: absolute;
+    pointer-events: none;
+    object-fit: contain;
+}
+
+.overlay-logo-impex {
+    top: 10px;
+    left: 10px;
+    width: 110px;
+    height: auto;
+}
+
+.overlay-logo-live {
+    top: 10px;
+    right: 10px;
+    width: 70px;
+    height: auto;
+}
+
+.camera-status {
+    background: rgba(0, 0, 0, 0.6);
+    padding: 8px 15px;
+    border-radius: 5px;
+    font-size: 12px;
+    color: #ff4444;
+}
+
+.controls {
+    display: flex;
+    gap: 10px;
+    padding: 15px 10px;
+    justify-content: center;
+}
+
+.btn {
+    padding: 12px 30px;
+    border: none;
+    border-radius: 5px;
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.3s;
+}
+
+.btn-icon {
+    font-size: 14px;
+}
+
+.btn-start {
+    background: #28a745;
+    color: white;
+}
+
+.btn-start:hover {
+    background: #218838;
+}
+
+.btn-stop {
+    background: #dc3545;
+    color: white;
+}
+
+.btn-stop:hover {
+    background: #c82333;
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Attendance Panel */
+.attendance-panel {
+    flex: 1;
+    background: transparent;
+    border-radius: 10px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    position: relative;
+    background-image: url('/static/icons/Vector-2.png');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+
+.attendance-header {
+    background: transparent;
+    padding: 15px;
+    border-radius: 8px;
+    margin-bottom: 15px;
+    position: relative;
+}
+
+.title-image {
+    display: block;
+    margin: 0 auto 10px auto;
+    max-width: 100%;
+    height: auto;
+    object-fit: contain;
+}
+
+.date-time {
+    margin-bottom: 10px;
+    background: #1a0000;
+    border: 2px solid #F39823;
+    border-radius: 8px;
+    padding: 15px 20px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+}
+
+.date {
+    font-size: 16px;
+    font-weight: bold;
+    color: #F39823;
+    margin: 0;
+}
+
+.time {
+    font-size: 28px;
+    font-weight: bold;
+    color: #F39823;
+    margin: 0;
+}
+
+.mode-toggle {
+    display: flex;
+    gap: 10px;
+    margin-top: 10px;
+}
+
+.mode-btn {
+    padding: 8px 20px;
+    background: #FF8C00;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: all 0.3s;
+}
+
+.mode-btn:hover {
+    background: #ff9933;
+}
+
+.mode-btn.active {
+    background: #ff6600;
+    box-shadow: 0 0 10px rgba(255, 140, 0, 0.5);
+}
+
+/* Cards Container */
+.cards-container {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px;
+    align-content: flex-start;
+    position: relative;
+    z-index: 2;
+    justify-content: flex-start;
+}
+
+.cards-section {
+    margin-top: 10px;
+    padding: 0 5px;
+}
+
+.remaining-section {
+    background: linear-gradient(180deg, #0f0c1f 0%, #0b1f15 100%);
+    border: 2px solid #F39823;
+    border-radius: 16px;
+    padding: 12px;
+    box-shadow: 0 0 10px rgba(243, 152, 35, 0.5);
+    display: none; /* hidden by default; shown only in checkout */
+}
+
+.remaining-header {
+    text-align: center;
+    color: #41d46a;
+    font-size: 24px;
+    font-weight: bold;
+    margin-bottom: 10px;
+}
+
+.remaining {
+    background: transparent;
+}
+
+/* Scrollbar Styling */
+.cards-container::-webkit-scrollbar {
+    width: 10px;
+}
+
+.cards-container::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 5px;
+}
+
+.cards-container::-webkit-scrollbar-thumb {
+    background: rgba(255, 140, 0, 0.5);
+    border-radius: 5px;
+}
+
+.cards-container::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 140, 0, 0.7);
+}
+
+/* Employee Card */
+.employee-card {
+    background: transparent;
+    border: 2px solid #F39823;
+    border-radius: 12px;
+    padding: 0;
+    width: calc(33.333% - 10px);
+    min-width: 180px;
+    display: flex;
+    flex-direction: column;
+    transition: all 0.3s;
+    box-shadow: 0 0 10px rgba(243, 152, 35, 0.5);
+    overflow: hidden;
+}
+
+.employee-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 0 15px rgba(243, 152, 35, 0.7);
+}
+
+/* Photo Section - White Background */
+.photo-container {
+    width: 100%;
+    height: 120px;
+    background: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 10px;
+}
+
+.photo-container img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.photo-placeholder {
+    width: 80px;
+    height: 80px;
+    background: #d3d3d3;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+}
+
+.photo-placeholder::before {
+    content: '';
+    width: 50px;
+    height: 50px;
+    background: #a0a0a0;
+    border-radius: 50%;
+    position: absolute;
+}
+
+.photo-placeholder::after {
+    content: '';
+    width: 60px;
+    height: 60px;
+    background: #b0b0b0;
+    border-radius: 50% 50% 0 0;
+    position: absolute;
+    top: 20px;
+}
+
+/* Info Section - Dark Brown Background */
+.employee-card-info {
+    background: linear-gradient(180deg, #3d2817 0%, #2a1a0f 100%);
+    padding: 12px 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.employee-id {
+    font-size: 14px;
+    color: white;
+    font-weight: bold;
+    margin: 0;
+}
+
+.employee-time {
+    font-size: 13px;
+    color: white;
+    margin: 0;
+}
+
+.employee-status {
+    font-size: 12px;
+    color: #ff4444;
+    font-weight: bold;
+    margin: 0;
+}
+
+.employee-status.on-time {
+    color: #44ff44;
+}
+
+/* Responsive Design */
+@media (max-width: 1400px) {
+    .employee-card {
+        width: calc(50% - 10px);
+    }
+}
+
+@media (max-width: 900px) {
+    .main-container {
+        flex-direction: column;
+    }
+    
+    .camera-panel {
+        flex: 0.6;
+    }
+    
+    .attendance-panel {
+        flex: 1;
+    }
+    
+    .employee-card {
+        width: calc(33.333% - 10px);
+    }
+}
+

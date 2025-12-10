@@ -1,0 +1,11 @@
+{
+    "ethernet_ip": "192.168.1.86",
+    "wifi_ip": "192.168.1.86",
+    "username": "admin",
+    "password": "Ikhlas@123",
+    "port": 554,
+    "auto_switch_enabled": false,
+    "preferred_connection": "router",
+    "monitor_interval": 5,
+    "failover_timeout": 5
+}

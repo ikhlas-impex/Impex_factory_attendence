@@ -1,0 +1,16 @@
+{
+    "source_type": "rtsp",
+    "rtsp_url": "rtsp://admin:Ikhlas@123@192.168.1.86:554/Streaming/Channels/101",
+    "usb_index": 0,
+    "resolution": "1920x1080",
+    "fps": 30,
+    "buffer_size": 1,
+    "transport": "TCP",
+    "camera_mac": "34:c6:dd:96:07:08",
+    "camera_ip": "192.168.1.86",
+    "http_port": 80,
+    "rtsp_port": 554,
+    "device_port": 8000,
+    "subnet_mask": "255.255.254.0",
+    "default_gateway": "192.168.1.1"
+}
