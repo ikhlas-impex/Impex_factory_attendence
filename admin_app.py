@@ -237,8 +237,21 @@ def add_staff_admin():
         # Use the first valid photo for storage (or you could store all photos)
         primary_photo = valid_photos[0]
         
+        # Get showcase photo if provided
+        showcase_photo = None
+        showcase_photo_data = data.get('showcase_photo')
+        if showcase_photo_data:
+            try:
+                if ',' in showcase_photo_data:
+                    showcase_photo_data = showcase_photo_data.split(',')[1]
+                photo_bytes = base64.b64decode(showcase_photo_data)
+                nparr = np.frombuffer(photo_bytes, np.uint8)
+                showcase_photo = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            except Exception as e:
+                print(f"Showcase photo decode error: {e}")
+        
         # Save to database with averaged embedding
-        success = db_manager.add_staff_member(staff_id, name, department, avg_embedding, primary_photo)
+        success = db_manager.add_staff_member(staff_id, name, department, avg_embedding, primary_photo, showcase_photo)
         
         if success:
             message = f'Staff member added successfully with {len(embeddings)} photos'
@@ -328,6 +341,21 @@ def update_staff_admin():
             except Exception as e:
                 print(f"Photo update error: {e}")
         
+        # Update showcase photo if provided (separate from regular photo)
+        showcase_photo_data = data.get('showcase_photo')
+        if showcase_photo_data:
+            try:
+                if ',' in showcase_photo_data:
+                    showcase_photo_data = showcase_photo_data.split(',')[1]
+                photo_bytes = base64.b64decode(showcase_photo_data)
+                nparr = np.frombuffer(photo_bytes, np.uint8)
+                showcase_photo_array = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if showcase_photo_array is not None:
+                    db_manager.update_staff_showcase_photo(staff_id, showcase_photo_array)
+            except Exception as e:
+                print(f"Showcase photo update error: {e}")
+        
         return jsonify({'success': True, 'message': 'Staff member updated successfully'})
         
     except Exception as e:
@@ -370,6 +398,58 @@ def get_staff_photo(staff_id):
             return Response(img_io, mimetype='image/jpeg')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/staff/<staff_id>/showcase-photo', methods=['GET'])
+def get_staff_showcase_photo(staff_id):
+    """Get staff showcase photo (for display during detection)"""
+    try:
+        showcase_photo = db_manager.get_staff_showcase_photo(staff_id)
+        if showcase_photo is not None:
+            success, buffer = cv2.imencode('.jpg', showcase_photo)
+            if success:
+                return Response(buffer.tobytes(), mimetype='image/jpeg')
+        
+        # Return placeholder if no showcase photo
+        img = Image.new('RGB', (300, 400), color='gray')
+        img_io = io.BytesIO()
+        img.save(img_io, 'JPEG')
+        img_io.seek(0)
+        return Response(img_io, mimetype='image/jpeg')
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/staff/<staff_id>/showcase-photo', methods=['POST'])
+def update_staff_showcase_photo(staff_id):
+    """Update showcase photo for staff member"""
+    try:
+        data = request.get_json()
+        photo_data = data.get('photo')  # Base64 encoded image
+        
+        if not photo_data:
+            return jsonify({'success': False, 'error': 'Photo data is required'}), 400
+        
+        # Decode photo
+        try:
+            if ',' in photo_data:
+                photo_data = photo_data.split(',')[1]
+            photo_bytes = base64.b64decode(photo_data)
+            nparr = np.frombuffer(photo_bytes, np.uint8)
+            photo_array = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if photo_array is not None:
+                success = db_manager.update_staff_showcase_photo(staff_id, photo_array)
+                if success:
+                    return jsonify({'success': True, 'message': 'Showcase photo updated successfully'})
+                else:
+                    return jsonify({'success': False, 'error': 'Failed to update showcase photo'}), 500
+            else:
+                return jsonify({'success': False, 'error': 'Invalid image data'}), 400
+        except Exception as e:
+            print(f"Photo decode error: {e}")
+            return jsonify({'success': False, 'error': f'Failed to decode image: {str(e)}'}), 400
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 # ==================== ATTENDANCE API ====================
 

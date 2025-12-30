@@ -216,6 +216,10 @@ class DatabaseManager:
                     print("Adding photo column to staff table")
                     cursor.execute("ALTER TABLE staff ADD COLUMN photo BLOB")
                 
+                if 'showcase_photo' not in staff_columns:
+                    print("Adding showcase_photo column to staff table")
+                    cursor.execute("ALTER TABLE staff ADD COLUMN showcase_photo BLOB")
+                
                 conn.commit()
                 conn.close()
                 print("✅ Database schema fixed successfully")
@@ -402,9 +406,10 @@ class DatabaseManager:
             print(f"❌ Error registering customer: {e}")
             return None
 
-    def add_staff_member(self, staff_id, name, department, embedding, image=None):
+    def add_staff_member(self, staff_id, name, department, embedding, image=None, showcase_image=None):
         """Add a staff member with proper embedding storage"""
         try:
+            import cv2
             with self.lock:
                 conn = sqlite3.connect(self.db_path)
                 cursor = conn.cursor()
@@ -412,10 +417,27 @@ class DatabaseManager:
                 # Store embedding properly
                 embedding_blob = pickle.dumps(embedding.astype(np.float32)) if embedding is not None else None
                 
+                # Store photo
+                photo_blob = None
+                if image is not None:
+                    if isinstance(image, np.ndarray):
+                        success, buffer = cv2.imencode('.jpg', image)
+                        if success:
+                            photo_blob = buffer.tobytes()
+                
+                # Store showcase photo (use showcase_image if provided, otherwise use image)
+                showcase_photo_blob = None
+                showcase_img = showcase_image if showcase_image is not None else image
+                if showcase_img is not None:
+                    if isinstance(showcase_img, np.ndarray):
+                        success, buffer = cv2.imencode('.jpg', showcase_img)
+                        if success:
+                            showcase_photo_blob = buffer.tobytes()
+                
                 cursor.execute('''
-                    INSERT OR REPLACE INTO staff (staff_id, name, department, embedding)
-                    VALUES (?, ?, ?, ?)
-                ''', (staff_id, name, department, embedding_blob))
+                    INSERT OR REPLACE INTO staff (staff_id, name, department, embedding, photo, showcase_photo)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (staff_id, name, department, embedding_blob, photo_blob, showcase_photo_blob))
                 
                 conn.commit()
                 conn.close()
@@ -522,7 +544,7 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 
                 cursor.execute('''
-                    SELECT staff_id, name, department, embedding, added_date, employee_id, photo
+                    SELECT staff_id, name, department, embedding, added_date, employee_id, photo, showcase_photo
                     FROM staff WHERE is_active = 1
                 ''')
                 
@@ -535,7 +557,8 @@ class DatabaseManager:
                         'embedding': row[3],
                         'added_date': row[4],
                         'employee_id': row[5] if len(row) > 5 else None,
-                        'photo': row[6] if len(row) > 6 else None
+                        'photo': row[6] if len(row) > 6 else None,
+                        'showcase_photo': row[7] if len(row) > 7 else None
                     })
                 
                 conn.close()
@@ -581,7 +604,7 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 
                 cursor.execute('''
-                    SELECT staff_id, name, department
+                    SELECT staff_id, name, department, photo, showcase_photo
                     FROM staff WHERE staff_id = ?
                 ''', (staff_id,))
                 
@@ -592,7 +615,9 @@ class DatabaseManager:
                     return {
                         'staff_id': row[0],
                         'name': row[1],
-                        'department': row[2]
+                        'department': row[2],
+                        'photo': row[3] if len(row) > 3 else None,
+                        'showcase_photo': row[4] if len(row) > 4 else None
                     }
                 return None
                 
@@ -655,7 +680,10 @@ class DatabaseManager:
                         ''', (time_str, confidence, staff_id, date_str))
                     else:
                         # Insert new record
-                        status = 'Late' if current_time > datetime.strptime('09:00:00', '%H:%M:%S').time() else 'Present'
+                        # Only mark as Late if between 9:00 AM and 9:20 AM
+                        expected_time = datetime.strptime('09:00:00', '%H:%M:%S').time()
+                        late_window_end = datetime.strptime('09:20:00', '%H:%M:%S').time()
+                        status = 'Late' if (expected_time < current_time <= late_window_end) else 'Present'
                         cursor.execute('''
                             INSERT INTO staff_attendance (staff_id, date, check_in_time, status, recognition_confidence)
                             VALUES (?, ?, ?, ?, ?)
@@ -663,8 +691,15 @@ class DatabaseManager:
 
                 # Persist check-in event (always for attendance recording)
                 if attendance_type == 'check_in':
-                    late_minutes = max(0, int((datetime.combine(current_date, current_time) - datetime.combine(current_date, datetime.strptime('09:00:00', '%H:%M:%S').time())).total_seconds() // 60))
-                    status_label = 'Late' if late_minutes > 0 else 'Present'
+                    # Only calculate late minutes if between 9:00 AM and 9:20 AM
+                    expected_time = datetime.strptime('09:00:00', '%H:%M:%S').time()
+                    late_window_end = datetime.strptime('09:20:00', '%H:%M:%S').time()
+                    if expected_time < current_time <= late_window_end:
+                        late_minutes = max(0, int((datetime.combine(current_date, current_time) - datetime.combine(current_date, expected_time)).total_seconds() // 60))
+                        status_label = 'Late'
+                    else:
+                        late_minutes = 0
+                        status_label = 'Present'
                     # Insert event row (photo optional; stored separately)
                     cursor.execute('''
                         INSERT INTO staff_checkins (staff_id, date, check_time, status, late_minutes, recognition_confidence, photo)
@@ -1079,6 +1114,33 @@ class DatabaseManager:
             print(f"❌ Error updating staff photo: {e}")
             return False
     
+    def update_staff_showcase_photo(self, staff_id, photo_data):
+        """Update showcase photo for staff member"""
+        try:
+            import cv2
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                # Convert image to bytes
+                if isinstance(photo_data, np.ndarray):
+                    success, buffer = cv2.imencode('.jpg', photo_data)
+                    if success:
+                        photo_blob = buffer.tobytes()
+                        cursor.execute('''
+                            UPDATE staff SET showcase_photo = ? WHERE staff_id = ?
+                        ''', (photo_blob, staff_id))
+                        conn.commit()
+                        conn.close()
+                        return True
+                
+                conn.close()
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error updating showcase photo: {e}")
+            return False
+    
     def get_staff_photo(self, staff_id):
         """Get staff photo"""
         try:
@@ -1101,6 +1163,33 @@ class DatabaseManager:
                 
         except Exception as e:
             print(f"❌ Error getting staff photo: {e}")
+            return None
+    
+    def get_staff_showcase_photo(self, staff_id):
+        """Get staff showcase photo (falls back to regular photo if showcase_photo is not set)"""
+        try:
+            import cv2
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                cursor.execute('SELECT showcase_photo, photo FROM staff WHERE staff_id = ?', (staff_id,))
+                row = cursor.fetchone()
+                conn.close()
+                
+                if row:
+                    # Try showcase_photo first, then fall back to photo
+                    photo_blob = row[0] if row[0] else row[1] if len(row) > 1 and row[1] else None
+                    if photo_blob:
+                        # Convert bytes back to image
+                        nparr = np.frombuffer(photo_blob, np.uint8)
+                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        return img if img is not None else None
+                
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error getting staff showcase photo: {e}")
             return None
     
     def record_unknown_entry(self, track_id, entry_type, frame_image, face_bbox=None, person_bbox=None, 

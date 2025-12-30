@@ -96,6 +96,14 @@ class ImpexAttendanceDashboard:
         self.employee_icons = {}
         self.load_employee_icons()
         
+        # Showcase photo display tracking
+        self.showcase_photo_visible = False
+        self.showcase_photo_staff_id = None
+        self.showcase_photo_display_time = None
+        self.showcase_photo_timer = None
+        self.showcase_photo_window_id = None
+        self.SHOWCASE_PHOTO_DISPLAY_DURATION = 30 * 60  # 30 minutes in seconds
+        
         # Setup UI
         self.setup_ui()
         

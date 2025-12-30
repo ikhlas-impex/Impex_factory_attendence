@@ -5,6 +5,8 @@ let isSystemRunning = false;
 let attendanceRefreshInterval = null;
 let systemStatusInterval = null;
 let allStaff = [];
+let activeCards = new Map(); // staff_id -> { cardElement, timerId, displayTime }
+const CARD_DISPLAY_DURATION = 30 * 60 * 1000; // 30 minutes in milliseconds
 
 // Initialize dashboard
 function initDashboard() {
@@ -14,14 +16,18 @@ function initDashboard() {
     // Load staff list once
     loadStaffList();
     
-    // Load attendance cards
-    refreshAttendanceCards();
-    
-    // Refresh attendance every 2 seconds
-    attendanceRefreshInterval = setInterval(refreshAttendanceCards, 2000);
+    // Load existing attendance cards on page load
+    loadExistingAttendanceCards();
     
     // Check system status every 5 seconds
     systemStatusInterval = setInterval(checkSystemStatus, 5000);
+    
+    // Listen for new detections via WebSocket or polling (using polling for now)
+    // Poll for new detections every 1 second (lighter than full refresh)
+    attendanceRefreshInterval = setInterval(checkForNewDetections, 1000);
+    
+    // Update card times every 5 seconds to keep them current
+    setInterval(updateAllCardTimes, 5000);
     
     // Set initial mode
     if (typeof SYSTEM_MODE !== 'undefined') {
@@ -92,6 +98,8 @@ async function stopSystem() {
         if (response.ok) {
             isSystemRunning = false;
             updateButtonStates();
+            // Clear all cards when system stops
+            clearAllCards();
             console.log('System stopped:', data);
         } else {
             alert('Error stopping system: ' + (data.error || 'Unknown error'));
@@ -130,7 +138,8 @@ async function setMode(mode) {
                 titleImage.src = titleSrc;
                 titleImage.alt = mode === 'checkin' ? 'Check In' : 'Check Out';
             }
-            refreshAttendanceCards();
+            // Cards are now shown dynamically on detection, no need to refresh
+            checkForNewDetections();
         } else {
             alert('Error setting mode: ' + (data.error || 'Unknown error'));
         }
@@ -195,8 +204,60 @@ async function checkSystemStatus() {
     }
 }
 
+// Load existing attendance cards on page initialization
+async function loadExistingAttendanceCards() {
+    try {
+        const response = await fetch('/api/attendance/today');
+        const data = await response.json();
+        
+        if (response.ok) {
+            const checkins = data.checkins || [];
+            
+            if (checkins.length > 0) {
+                // Sort by time (most recent first)
+                const sortedCheckins = [...checkins].sort((a, b) => {
+                    const timeA = a.check_time || a.check_in_time || '';
+                    const timeB = b.check_time || b.check_in_time || '';
+                    return timeB.localeCompare(timeA);
+                });
+                
+                // Show cards for all existing check-ins (within 30-minute window)
+                sortedCheckins.forEach(checkin => {
+                    const staffId = checkin.staff_id;
+                    if (staffId) {
+                        // Check if check-in is within 30-minute window
+                        const checkTimeStr = checkin.check_time || checkin.check_in_time;
+                        if (checkTimeStr) {
+                            try {
+                                const checkTime = new Date(checkTimeStr);
+                                const now = new Date();
+                                const elapsed = now - checkTime;
+                                
+                                // Only show if within 30-minute window
+                                if (elapsed <= CARD_DISPLAY_DURATION) {
+                                    showDetectionCard(checkin, data.mode || systemMode, true); // true = isExisting
+                                }
+                            } catch (e) {
+                                // If time parsing fails, show the card anyway
+                                showDetectionCard(checkin, data.mode || systemMode, true);
+                            }
+                        } else {
+                            showDetectionCard(checkin, data.mode || systemMode, true);
+                        }
+                    }
+                });
+            }
+        } else {
+            console.error('Error loading existing attendance:', data.error);
+        }
+    } catch (error) {
+        console.error('Error loading existing attendance cards:', error);
+    }
+}
+
 // Refresh attendance cards
-async function refreshAttendanceCards() {
+// Check for new detections and show cards dynamically
+async function checkForNewDetections() {
     try {
         const response = await fetch('/api/attendance/today');
         const data = await response.json();
@@ -204,13 +265,238 @@ async function refreshAttendanceCards() {
         if (response.ok) {
             const checkins = data.checkins || [];
             const attendance = data.attendance || [];
-            displayAttendanceCards(checkins, attendance, data.mode || systemMode);
+            
+            // Process all checkins to update existing cards or add new ones
+            if (checkins.length > 0) {
+                // Get the most recent check-in per staff_id
+                const latestByStaff = {};
+                checkins.forEach(checkin => {
+                    const staffId = checkin.staff_id;
+                    if (!staffId) return;
+                    
+                    const checkTime = checkin.check_time || checkin.check_in_time || '';
+                    const existing = latestByStaff[staffId];
+                    
+                    if (!existing || checkTime.localeCompare(existing.check_time || existing.check_in_time || '') > 0) {
+                        latestByStaff[staffId] = checkin;
+                    }
+                });
+                
+                // Update or create cards
+                Object.values(latestByStaff).forEach(checkin => {
+                    const staffId = checkin.staff_id;
+                    if (staffId) {
+                        if (activeCards.has(staffId)) {
+                            // Update existing card time
+                            updateCardTime(staffId, checkin);
+                        } else {
+                            // New detection - show card
+                            showDetectionCard(checkin, data.mode || systemMode, false);
+                        }
+                    }
+                });
+            }
+            
+            // Clean up expired cards
+            cleanupExpiredCards();
         } else {
             console.error('Error loading attendance:', data.error);
         }
     } catch (error) {
-        console.error('Error refreshing attendance cards:', error);
+        console.error('Error checking for new detections:', error);
     }
+}
+
+// Show card for a detected staff member
+function showDetectionCard(item, mode, isExisting = false) {
+    const checkedContainer = document.getElementById('checkedOutContainer');
+    if (!checkedContainer) return;
+    
+    const staffId = item.staff_id;
+    if (!staffId) return;
+    
+    // Remove existing card if any (shouldn't happen, but safety check)
+    if (activeCards.has(staffId)) {
+        removeCard(staffId);
+    }
+    
+    // Create and add card
+    const card = createEmployeeCard(item, mode);
+    card.dataset.staffId = staffId;
+    
+    // Set display time based on check-in time or now
+    const checkTimeStr = item.check_time || item.check_in_time;
+    let displayTime = Date.now();
+    if (checkTimeStr && isExisting) {
+        try {
+            const checkTime = new Date(checkTimeStr);
+            displayTime = checkTime.getTime();
+        } catch (e) {
+            displayTime = Date.now();
+        }
+    }
+    card.dataset.displayTime = displayTime;
+    
+    // Calculate remaining time for timer
+    const elapsed = Date.now() - displayTime;
+    const remainingTime = Math.max(0, CARD_DISPLAY_DURATION - elapsed);
+    
+    // Add card to container (at the beginning for most recent first)
+    checkedContainer.insertBefore(card, checkedContainer.firstChild);
+    
+    // Set timer to remove card after remaining duration
+    const timerId = setTimeout(() => {
+        removeCard(staffId);
+    }, remainingTime);
+    
+    // Track active card
+    activeCards.set(staffId, {
+        cardElement: card,
+        timerId: timerId,
+        displayTime: displayTime,
+        lastUpdateTime: Date.now()
+    });
+    
+    console.log(`✅ ${isExisting ? 'Loaded' : 'Showing'} card for ${item.name || staffId}`);
+}
+
+// Update card time display
+function updateCardTime(staffId, item) {
+    if (!activeCards.has(staffId)) return;
+    
+    const cardData = activeCards.get(staffId);
+    const card = cardData.cardElement;
+    if (!card) return;
+    
+    // Update time label in the card
+    const timeLabel = card.querySelector('.employee-time');
+    if (timeLabel) {
+        const checkTimeStr = item.check_time || item.check_in_time;
+        if (checkTimeStr) {
+            timeLabel.textContent = formatTime(checkTimeStr);
+        }
+    }
+    
+    // Update status/late minutes if needed
+    const statusLabel = card.querySelector('.employee-status');
+    if (statusLabel) {
+        const checkTimeStr = item.check_time || item.check_in_time;
+        let showLate = false;
+        let lateMinutes = 0;
+        
+        if (typeof item.late_minutes === 'number' && item.late_minutes > 0 && checkTimeStr) {
+            try {
+                const checkTime = new Date(checkTimeStr);
+                const hours = checkTime.getHours();
+                const minutes = checkTime.getMinutes();
+                const totalMinutes = hours * 60 + minutes;
+                const startMinutes = 9 * 60; // 9:00 AM
+                const endMinutes = 9 * 60 + 20; // 9:20 AM
+                
+                if (totalMinutes > startMinutes && totalMinutes <= endMinutes) {
+                    showLate = true;
+                    lateMinutes = item.late_minutes;
+                }
+            } catch (e) {
+                if (item.late_minutes > 0) {
+                    showLate = true;
+                    lateMinutes = item.late_minutes;
+                }
+            }
+        }
+        
+        if (showLate && lateMinutes > 0) {
+            statusLabel.textContent = `${lateMinutes} min Late`;
+            statusLabel.classList.remove('on-time');
+        } else {
+            statusLabel.textContent = item.status && !item.status.toLowerCase().includes('late') 
+                ? item.status 
+                : 'Present';
+            if (!showLate) {
+                statusLabel.classList.add('on-time');
+            }
+        }
+    }
+    
+    // Update last update time
+    cardData.lastUpdateTime = Date.now();
+    
+    console.log(`🔄 Updated card time for ${item.name || staffId}`);
+}
+
+// Remove card for a staff member
+function removeCard(staffId) {
+    if (!activeCards.has(staffId)) return;
+    
+    const cardData = activeCards.get(staffId);
+    if (cardData.cardElement && cardData.cardElement.parentNode) {
+        cardData.cardElement.parentNode.removeChild(cardData.cardElement);
+    }
+    if (cardData.timerId) {
+        clearTimeout(cardData.timerId);
+    }
+    activeCards.delete(staffId);
+    console.log(`🗑️ Removed card for ${staffId}`);
+}
+
+// Clean up expired cards
+function cleanupExpiredCards() {
+    const now = Date.now();
+    for (const [staffId, cardData] of activeCards.entries()) {
+        const elapsed = now - cardData.displayTime;
+        if (elapsed >= CARD_DISPLAY_DURATION) {
+            removeCard(staffId);
+        }
+    }
+}
+
+// Update all card times periodically
+async function updateAllCardTimes() {
+    try {
+        const response = await fetch('/api/attendance/today');
+        const data = await response.json();
+        
+        if (response.ok) {
+            const checkins = data.checkins || [];
+            
+            // Create a map of staff_id -> latest checkin
+            const latestByStaff = {};
+            checkins.forEach(checkin => {
+                const staffId = checkin.staff_id;
+                if (!staffId) return;
+                
+                const checkTime = checkin.check_time || checkin.check_in_time || '';
+                const existing = latestByStaff[staffId];
+                
+                if (!existing || checkTime.localeCompare(existing.check_time || existing.check_in_time || '') > 0) {
+                    latestByStaff[staffId] = checkin;
+                }
+            });
+            
+            // Update times for all active cards
+            for (const [staffId, cardData] of activeCards.entries()) {
+                if (latestByStaff[staffId]) {
+                    updateCardTime(staffId, latestByStaff[staffId]);
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Error updating card times:', error);
+    }
+}
+
+// Clear all active cards
+function clearAllCards() {
+    for (const staffId of Array.from(activeCards.keys())) {
+        removeCard(staffId);
+    }
+}
+
+// Legacy function kept for compatibility (but not used for auto-refresh)
+async function refreshAttendanceCards() {
+    // This function is kept for compatibility but auto-refresh is disabled
+    // Cards are now shown dynamically on detection
+    checkForNewDetections();
 }
 
 // Display attendance cards (checked vs remaining)
@@ -331,7 +617,19 @@ function createEmployeeCard(item, mode) {
     const photoContainer = document.createElement('div');
     photoContainer.className = 'photo-container';
     
-    if (item.photo) {
+    // Use showcase photo URL if available, otherwise fallback to captured photo or placeholder
+    if (item.photo_url) {
+        const img = document.createElement('img');
+        img.src = item.photo_url + '?t=' + Date.now(); // Add timestamp to prevent caching
+        img.alt = 'Employee Photo';
+        img.onerror = function() {
+            // Fallback to placeholder if showcase photo fails to load
+            this.src = '/static/icons/Clip path group.png';
+            this.className = 'photo-placeholder-icon';
+        };
+        photoContainer.appendChild(img);
+    } else if (item.photo) {
+        // Fallback to captured photo if showcase photo URL not available
         const img = document.createElement('img');
         img.src = 'data:image/jpeg;base64,' + item.photo;
         img.alt = 'Employee Photo';
@@ -371,7 +669,7 @@ function createEmployeeCard(item, mode) {
             : '--:--';
     }
     
-    // Status (Late time for check-in)
+    // Status (Late time for check-in - only show if between 9:00 AM and 9:20 AM)
     const statusLabel = document.createElement('div');
     statusLabel.className = 'employee-status';
     
@@ -379,9 +677,37 @@ function createEmployeeCard(item, mode) {
         // Do not show late/present status on checkout cards
         statusLabel.textContent = '';
     } else {
-        if (typeof item.late_minutes === 'number' && item.late_minutes > 0) {
-            statusLabel.textContent = `${item.late_minutes} min Late`;
-        } else if (item.status) {
+        // Only show late status if check-in is between 9:00 AM and 9:20 AM
+        const checkTimeStr = item.check_time || item.check_in_time;
+        let showLate = false;
+        let lateMinutes = 0;
+        
+        if (typeof item.late_minutes === 'number' && item.late_minutes > 0 && checkTimeStr) {
+            // Verify the time is actually between 9:00 AM and 9:20 AM
+            try {
+                const checkTime = new Date(checkTimeStr);
+                const hours = checkTime.getHours();
+                const minutes = checkTime.getMinutes();
+                const totalMinutes = hours * 60 + minutes;
+                const startMinutes = 9 * 60; // 9:00 AM
+                const endMinutes = 9 * 60 + 20; // 9:20 AM
+                
+                if (totalMinutes > startMinutes && totalMinutes <= endMinutes) {
+                    showLate = true;
+                    lateMinutes = item.late_minutes;
+                }
+            } catch (e) {
+                // If parsing fails, use the provided late_minutes if > 0
+                if (item.late_minutes > 0) {
+                    showLate = true;
+                    lateMinutes = item.late_minutes;
+                }
+            }
+        }
+        
+        if (showLate && lateMinutes > 0) {
+            statusLabel.textContent = `${lateMinutes} min Late`;
+        } else if (item.status && !item.status.toLowerCase().includes('late')) {
             statusLabel.textContent = item.status;
             if (item.status.toLowerCase().includes('on time') || item.status.toLowerCase().includes('present')) {
                 statusLabel.classList.add('on-time');

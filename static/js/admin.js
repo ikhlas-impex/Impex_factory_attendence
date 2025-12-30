@@ -207,6 +207,7 @@ function openAddStaffModal() {
     document.getElementById('editStaffId').value = '';
     document.getElementById('staffId').disabled = false;
     document.getElementById('photoPreview').innerHTML = '<span>Click to upload photo or capture from camera</span>';
+    document.getElementById('showcasePhotoPreview').innerHTML = '<span>Click to upload showcase photo</span>';
     document.getElementById('staffModal').style.display = 'block';
 }
 
@@ -229,6 +230,11 @@ async function editStaff(staffId) {
     const photoUrl = `/api/admin/staff/${staff.staff_id}/photo`;
     document.getElementById('photoPreview').innerHTML = `<img src="${photoUrl}" alt="Staff Photo" style="width: 100%; height: 100%; object-fit: cover;">`;
     
+    // Load showcase photo
+    const showcasePhotoUrl = `/api/admin/staff/${staff.staff_id}/showcase-photo`;
+    const showcasePreview = document.getElementById('showcasePhotoPreview');
+    showcasePreview.innerHTML = `<img src="${showcasePhotoUrl}" alt="Showcase Photo" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.parentElement.innerHTML='<span>Click to upload showcase photo</span>'">`;
+    
     document.getElementById('staffModal').style.display = 'block';
 }
 
@@ -242,6 +248,24 @@ function previewPhoto(event) {
         };
         reader.readAsDataURL(file);
     }
+}
+
+function previewShowcasePhoto(event) {
+    const file = event.target.files[0];
+    if (file) {
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const preview = document.getElementById('showcasePhotoPreview');
+            preview.innerHTML = `<img src="${e.target.result}" alt="Showcase Preview" style="width: 100%; height: 100%; object-fit: cover;">`;
+        };
+        reader.readAsDataURL(file);
+    }
+}
+
+function clearShowcasePhoto() {
+    const preview = document.getElementById('showcasePhotoPreview');
+    preview.innerHTML = '<span>Click to upload showcase photo</span>';
+    document.getElementById('staffShowcasePhoto').value = '';
 }
 
 function setupFormHandlers() {
@@ -262,6 +286,39 @@ async function saveStaff() {
             department: document.getElementById('staffDepartment').value.trim(),
         };
         
+        // Check if multiple photos were captured from camera
+        const photoPreview = document.getElementById('photoPreview');
+        const capturedPhotosData = photoPreview.dataset.capturedPhotos;
+        const photoImg = photoPreview.querySelector('img');
+        const photoFile = document.getElementById('staffPhoto').files[0];
+        
+        // Get showcase photo
+        const showcasePhotoFile = document.getElementById('staffShowcasePhoto').files[0];
+        const showcasePhotoPreview = document.getElementById('showcasePhotoPreview');
+        const showcasePhotoImg = showcasePhotoPreview.querySelector('img');
+        
+        if (showcasePhotoFile) {
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                formData.showcase_photo = e.target.result;
+                await processMainPhoto(formData);
+            };
+            reader.readAsDataURL(showcasePhotoFile);
+            return;
+        } else if (showcasePhotoImg && showcasePhotoImg.src && !showcasePhotoImg.src.includes('/api/admin/staff/')) {
+            // Showcase photo was already loaded from file (not from server)
+            formData.showcase_photo = showcasePhotoImg.src;
+        }
+        
+        await processMainPhoto(formData);
+    } catch (error) {
+        console.error('Error saving staff:', error);
+        alert('Error saving staff: ' + error.message);
+    }
+}
+
+async function processMainPhoto(formData) {
+    try {
         // Check if multiple photos were captured from camera
         const photoPreview = document.getElementById('photoPreview');
         const capturedPhotosData = photoPreview.dataset.capturedPhotos;
@@ -327,6 +384,11 @@ async function submitStaffForm(formData) {
         const data = await response.json();
         
         if (data.success) {
+            // If showcase photo was provided, update it separately
+            if (formData.showcase_photo && editId) {
+                await updateShowcasePhoto(editId, formData.showcase_photo);
+            }
+            
             alert(data.message || 'Staff saved successfully');
             closeStaffModal();
             loadStaffList();
@@ -337,6 +399,25 @@ async function submitStaffForm(formData) {
     } catch (error) {
         console.error('Error submitting staff form:', error);
         alert('Error: ' + error.message);
+    }
+}
+
+async function updateShowcasePhoto(staffId, photoData) {
+    try {
+        const response = await fetch(`/api/admin/staff/${staffId}/showcase-photo`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ photo: photoData })
+        });
+        
+        const data = await response.json();
+        if (!data.success) {
+            console.error('Failed to update showcase photo:', data.error);
+        }
+    } catch (error) {
+        console.error('Error updating showcase photo:', error);
     }
 }
 

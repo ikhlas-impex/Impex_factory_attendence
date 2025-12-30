@@ -78,6 +78,9 @@ next_track_id = 1        # incremental track id
 deepsort_tracker = DeepSort()
 track_states = {}  # track_id -> dict with staff/unknown history
 
+# Track staff presence in frame: staff_id -> {first_detection_time, last_seen_time, track_id, in_frame}
+staff_in_frame = {}  # staff_id -> {'first_detection': datetime, 'last_seen': time, 'track_id': int, 'in_frame': bool}
+
 # MediaPipe face detection + unknown-embedding cache
 _mp_face_detector = None
 recent_unknowns = []  # list of dicts: {'embedding': np.ndarray, 'ts': float}
@@ -498,6 +501,9 @@ def process_video_loop():
 
                 ds_tracks = deepsort_tracker.update(ds_detections) if ds_detections else []
 
+                # Track which staff members are currently detected in this frame
+                current_frame_staff = set()
+
                 # Map DeepSort track outputs back to our detections via IoU
                 det_bboxes = [d['bbox'] for d in detections]
                 track_ids = [None] * len(detections)
@@ -511,7 +517,19 @@ def process_video_loop():
                             best_idx = idx
                     if best_idx is not None and best_iou >= 0.3 and track_ids[best_idx] is None:
                         track_ids[best_idx] = int(track_id)
+                
+                # Mark staff as not in frame if they're not detected in this frame
+                current_time = time.time()
+                for staff_id, staff_info in list(staff_in_frame.items()):
+                    if staff_id not in detected_staff_ids:
+                        # If staff member hasn't been seen in 10 seconds, mark as out of frame
+                        if current_time - staff_info.get('last_seen', 0) > 10.0:
+                            staff_info['in_frame'] = False
+                            print(f"⏸️ Staff {staff_id} left frame (not detected for 10+ seconds)")
 
+                # Track which staff members are currently detected in this frame
+                detected_staff_ids = set()
+                
                 for det_idx, detection in enumerate(detections):
                     bbox = detection['bbox']
                     embedding = detection['embedding']
@@ -520,6 +538,10 @@ def process_video_loop():
 
                     # Identify person
                     person_type, person_id, rec_confidence = face_engine.identify_person(embedding)
+                    
+                    # Track detected staff
+                    if person_type == 'staff' and person_id and rec_confidence >= 0.55:
+                        detected_staff_ids.add(person_id)
 
                     # Track-level state for stronger staff/unknown decisions
                     if track_id is not None:
@@ -565,7 +587,7 @@ def process_video_loop():
                                     state["staff_confirmed"] = False
                                 # Once staff is confirmed, never allow unknown recording for this track
                                 state["unknown_recorded"] = False
-                        process_attendance(person_id, frame, bbox, rec_confidence)
+                        process_attendance(person_id, frame, bbox, rec_confidence, track_id)
                     # For unknown / low-confidence detections, avoid recording as unknown
                     # if this track was already seen as staff recently.
                     elif person_type in ('unknown', 'staff'):
@@ -633,24 +655,39 @@ def process_video_loop():
             print(f"Processing error: {e}")
             time.sleep(0.1)
 
-def process_attendance(staff_id, frame, bbox, confidence):
-    """Process attendance for recognized staff"""
-    global today_attendance, captured_photos
+def process_attendance(staff_id, frame, bbox, confidence, track_id=None):
+    """Process attendance for recognized staff - only records when person enters frame"""
+    global today_attendance, captured_photos, staff_in_frame
     
     try:
         now = datetime.now()
         current_time = time.time()
         
-        # Debounce: only process once per 30 seconds per staff_id
-        if not hasattr(process_attendance, 'last_processed'):
-            process_attendance.last_processed = {}
+        # Check if this staff member is already in frame
+        if staff_id in staff_in_frame:
+            staff_info = staff_in_frame[staff_id]
+            
+            # Check if same track (person still in frame)
+            if track_id is not None and staff_info.get('track_id') == track_id:
+                # Same person still in frame - just update last_seen time, don't record new check-in
+                staff_info['last_seen'] = current_time
+                staff_info['in_frame'] = True
+                return
+            
+            # Check if person left and came back (gap in detection > 5 seconds)
+            time_since_last_seen = current_time - staff_info.get('last_seen', 0)
+            if time_since_last_seen < 5.0:
+                # Still in frame (within 5 seconds) - don't record new check-in
+                staff_info['last_seen'] = current_time
+                staff_info['in_frame'] = True
+                if track_id is not None:
+                    staff_info['track_id'] = track_id
+                return
+            
+            # Person left frame and came back - record new check-in
+            print(f"🔄 Staff {staff_id} left frame and returned - recording new check-in")
         
-        last_time = process_attendance.last_processed.get(staff_id, 0)
-        if current_time - last_time < 30.0:
-            return
-        
-        process_attendance.last_processed[staff_id] = current_time
-        
+        # New detection or person returned - record check-in
         # Capture photo
         x1, y1, x2, y2 = map(int, bbox)
         x1 = max(0, x1 - 10)
@@ -661,12 +698,20 @@ def process_attendance(staff_id, frame, bbox, confidence):
         captured_photo = frame[y1:y2, x1:x2].copy()
         captured_photos[staff_id] = captured_photo.tolist()  # Convert to list for JSON
         
-        # Record attendance
+        # Record attendance based on mode
         if system_mode == 'checkin':
             record_checkin(staff_id, now, float(confidence))
         else:
             record_checkout(staff_id, now, float(confidence))
-            
+        
+        # Track this staff member as in frame
+        staff_in_frame[staff_id] = {
+            'first_detection': now,
+            'last_seen': current_time,
+            'track_id': track_id,
+            'in_frame': True
+        }
+        
     except Exception as e:
         print(f"Attendance processing error: {e}")
 
@@ -775,20 +820,43 @@ def process_unknown_entry(frame, bbox, det_confidence, rec_confidence, person_ty
         traceback.print_exc()
 
 def record_checkin(staff_id, check_time, confidence):
-    """Record check-in"""
+    """Record check-in - only records if this is a new entry (not updating existing)"""
     try:
+        # Check if this staff member already has a check-in today
+        existing_checkin = today_attendance.get(staff_id)
+        if existing_checkin and existing_checkin.get('check_in_time'):
+            # Check if this is the same check-in session (within 30 minutes)
+            try:
+                existing_time = datetime.fromisoformat(existing_checkin['check_in_time'])
+                time_diff = (check_time - existing_time).total_seconds()
+                
+                # If within 30 minutes, don't create a new check-in record
+                # Just update the last_seen time in staff_in_frame
+                if time_diff < 30 * 60:
+                    print(f"⏭️ Staff {staff_id} already checked in at {existing_time.strftime('%I:%M %p')} - skipping duplicate")
+                    return
+            except Exception as e:
+                print(f"Error parsing existing check-in time: {e}")
+        
         expected_time = datetime.strptime('09:00:00', '%H:%M:%S').time()
-        is_late = check_time.time() > expected_time
+        late_window_end = datetime.strptime('09:20:00', '%H:%M:%S').time()
+        check_time_only = check_time.time()
+        
+        # Only show late status if check-in is between 9:00 AM and 9:20 AM
+        is_late = expected_time < check_time_only <= late_window_end
         
         if is_late:
-            minutes_late = int((check_time.time().hour * 60 + check_time.time().minute) - 
+            minutes_late = int((check_time_only.hour * 60 + check_time_only.minute) - 
                              (expected_time.hour * 60 + expected_time.minute))
         else:
             minutes_late = 0
         
         status = f"{minutes_late} min Late" if is_late else "On Time"
-        # Late minutes relative to 09:00 for event logging (every after-09:05 counts)
-        late_minutes_event = max(0, int((check_time.time().hour * 60 + check_time.time().minute) - (expected_time.hour * 60 + expected_time.minute)))
+        # Late minutes relative to 09:00 for event logging (only between 9:00-9:20)
+        if expected_time < check_time_only <= late_window_end:
+            late_minutes_event = max(0, int((check_time_only.hour * 60 + check_time_only.minute) - (expected_time.hour * 60 + expected_time.minute)))
+        else:
+            late_minutes_event = 0
         
         today_attendance[staff_id] = {
             'staff_id': staff_id,
@@ -920,14 +988,8 @@ def get_today_attendance():
             staff_info = db_manager.get_staff_info(staff_id)
             employee_id = get_employee_id(staff_id)
             
-            photo_data = None
-            if staff_id in captured_photos:
-                try:
-                    photo_array = np.array(captured_photos[staff_id], dtype=np.uint8)
-                    _, buffer = cv2.imencode('.jpg', photo_array)
-                    photo_data = base64.b64encode(buffer).decode('utf-8')
-                except Exception as e:
-                    print(f"Error encoding photo for {staff_id}: {e}")
+            # Get showcase photo URL instead of captured photo
+            showcase_photo_url = f'/api/admin/staff/{staff_id}/showcase-photo'
             
             attendance_list.append({
                 'staff_id': staff_id,
@@ -936,7 +998,7 @@ def get_today_attendance():
                 'check_in_time': att.get('check_in_time').isoformat() if att.get('check_in_time') else None,
                 'check_out_time': att.get('check_out_time').isoformat() if att.get('check_out_time') else None,
                 'status': att.get('status', 'Present'),
-                'photo': photo_data
+                'photo_url': showcase_photo_url  # Use showcase photo URL instead of captured photo
             })
 
         # Build check-in events list (multiple per day)
@@ -950,14 +1012,27 @@ def get_today_attendance():
             if ev.get('date') and check_time_raw:
                 check_time_iso = f"{ev['date']}T{check_time_raw}"
 
-            photo_data = None
-            if staff_id in captured_photos:
+            # Get showcase photo URL instead of captured photo
+            showcase_photo_url = f'/api/admin/staff/{staff_id}/showcase-photo'
+
+            # Only include late_minutes if check-in is between 9:00 AM and 9:20 AM
+            late_minutes = ev.get('late_minutes', 0)
+            check_time_obj = None
+            if check_time_iso:
                 try:
-                    photo_array = np.array(captured_photos[staff_id], dtype=np.uint8)
-                    _, buffer = cv2.imencode('.jpg', photo_array)
-                    photo_data = base64.b64encode(buffer).decode('utf-8')
-                except Exception as e:
-                    print(f"Error encoding photo for {staff_id}: {e}")
+                    check_time_obj = datetime.fromisoformat(check_time_iso.replace('Z', '+00:00')).time()
+                except:
+                    try:
+                        check_time_obj = datetime.strptime(check_time_iso.split('T')[1] if 'T' in check_time_iso else check_time_iso, '%H:%M:%S').time()
+                    except:
+                        pass
+            
+            # Only show late if between 9:00 AM and 9:20 AM
+            if check_time_obj:
+                expected_time = datetime.strptime('09:00:00', '%H:%M:%S').time()
+                late_window_end = datetime.strptime('09:20:00', '%H:%M:%S').time()
+                if not (expected_time < check_time_obj <= late_window_end):
+                    late_minutes = 0
 
             checkin_list.append({
                 'staff_id': staff_id,
@@ -965,8 +1040,8 @@ def get_today_attendance():
                 'name': staff_info.get('name', 'Unknown') if staff_info else 'Unknown',
                 'check_time': check_time_iso,
                 'status': ev.get('status', 'Present'),
-                'late_minutes': ev.get('late_minutes', 0),
-                'photo': photo_data
+                'late_minutes': late_minutes,  # Only non-zero if between 9:00-9:20
+                'photo_url': showcase_photo_url  # Use showcase photo URL instead of captured photo
             })
         
         return jsonify({'attendance': attendance_list, 'checkins': checkin_list, 'mode': system_mode})
@@ -1064,6 +1139,25 @@ def set_mode():
         system_mode = new_mode
         return jsonify({'status': 'updated', 'mode': system_mode})
     return jsonify({'error': 'Invalid mode'}), 400
+
+@app.route('/api/admin/staff/<staff_id>/showcase-photo', methods=['GET'])
+def get_staff_showcase_photo_web(staff_id):
+    """Get staff showcase photo (for display in employee cards)"""
+    try:
+        showcase_photo = db_manager.get_staff_showcase_photo(staff_id)
+        if showcase_photo is not None:
+            success, buffer = cv2.imencode('.jpg', showcase_photo)
+            if success:
+                return Response(buffer.tobytes(), mimetype='image/jpeg')
+        
+        # Return placeholder if no showcase photo
+        img = Image.new('RGB', (300, 400), color='gray')
+        img_io = io.BytesIO()
+        img.save(img_io, 'JPEG')
+        img_io.seek(0)
+        return Response(img_io, mimetype='image/jpeg')
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     import argparse
