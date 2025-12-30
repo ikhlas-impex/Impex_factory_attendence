@@ -109,7 +109,31 @@ class ConfigManager:
             try:
                 with open(self.camera_file, 'r', encoding='utf-8') as f:
                     settings = json.load(f)
-                    print(f"Loaded camera settings: {settings}")
+                    # If mode-specific RTSP URLs are provided, select the correct one
+                    try:
+                        # Prefer explicit environment override for concurrent servers
+                        import os as _os
+                        mode = _os.environ.get('IMPEX_SYSTEM_MODE')
+                        if not mode:
+                            mode = self.get_system_mode()
+                    except Exception:
+                        mode = self.get_system_mode()
+
+                    checkin_rtsp = settings.get("checkin_rtsp_url")
+                    checkout_rtsp = settings.get("checkout_rtsp_url")
+
+                    if checkin_rtsp or checkout_rtsp:
+                        # Derive the effective RTSP URL based on mode
+                        if mode == "checkout" and checkout_rtsp:
+                            effective_rtsp = checkout_rtsp
+                        else:
+                            # Default to check-in camera when in doubt
+                            effective_rtsp = checkin_rtsp or checkout_rtsp or settings.get("rtsp_url")
+
+                        # Do NOT persist this change to disk; only modify the in-memory view
+                        settings["rtsp_url"] = effective_rtsp
+
+                    print(f"Loaded camera settings (mode={mode}): {settings}")
                     return settings
             except Exception as e:
                 print(f"Error loading camera settings: {e}")

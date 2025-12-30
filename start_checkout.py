@@ -8,6 +8,10 @@ Runs on port 8000, locked to check-out mode
 import sys
 import os
 
+# Explicitly mark this process as the CHECK-OUT server so configuration
+# (especially camera selection) can be mode-specific without conflicts.
+os.environ["IMPEX_SYSTEM_MODE"] = "checkout"
+
 # Add current directory to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -17,15 +21,19 @@ if current_dir not in sys.path:
 if __name__ == '__main__':
     # Import web_app module
     import web_app
+    from core.config_manager import ConfigManager
+    
+    # Get port from config before initializing
+    config = ConfigManager()
+    system_config = config.get_system_config()
+    port = system_config.get('checkout_port', 8000)
     
     # Initialize system with check-out mode locked
     if not web_app.init_system(forced_mode='checkout'):
         print("❌ Failed to initialize check-out system")
         sys.exit(1)
     
-    # Run on port 8000
     host = '0.0.0.0'
-    port = 8000
     
     print("=" * 70)
     print("🌐 IMPEX ATTENDANCE SYSTEM - CHECK-OUT SERVER")

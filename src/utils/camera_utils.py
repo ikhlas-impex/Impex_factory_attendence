@@ -143,8 +143,8 @@ class CameraManager:
                 # CRITICAL: Actually attempt the connection
                 if self._attempt_connection(camera_source, cv2.CAP_FFMPEG):
                     return True
-                print("❌ Initial connection failed. Attempting to rediscover camera...")
-                return self._update_ip_and_retry()
+                print("❌ Initial connection failed. Rediscovery is disabled to preserve configured IP.")
+                return False
 
         except Exception as e:
             print(f"❌ Camera start error: {e}")
@@ -246,10 +246,11 @@ class CameraManager:
             return False
 
     def _ultra_low_latency_capture(self):
-        """Ultra-optimized frame capture with latency reduction"""
+        """Ultra-optimized frame capture with latency reduction - ensures first frame is immediately available"""
         consecutive_failures = 0
         max_failures = 5  # Reduced for faster failure detection
         frame_count = 0
+        first_frame_processed = False
 
         while self.running and self.cap:
             try:
@@ -257,14 +258,34 @@ class CameraManager:
                     time.sleep(0.05)
                     continue
 
-                # Skip frames in buffer to get latest (reduces latency) - OPTIMIZED
-                for _ in range(3):  # Skip 3 frames to get freshest frame (reduces lag)
-                    ret, _ = self.cap.read()
-                    if not ret:
-                        break
+                # For first frame, don't skip - process immediately to start detection ASAP
+                # After first frame, skip buffered frames to get latest (reduces latency)
+                if not first_frame_processed:
+                    # Process first frame immediately - no skipping
+                    ret, frame = self.cap.read()
+                    if ret and frame is not None:
+                        first_frame_processed = True
+                        frame_count += 1
+                        print("✅ First frame captured - Face detection will start immediately")
+                        # Put first frame in queue for immediate processing
+                        try:
+                            if not self.frame_queue.empty():
+                                self.frame_queue.get_nowait()
+                            self.frame_queue.put_nowait(frame)
+                        except:
+                            pass
+                    else:
+                        time.sleep(0.01)
+                    continue
+                else:
+                    # Skip frames in buffer to get latest (reduces latency) - OPTIMIZED
+                    for _ in range(3):  # Skip 3 frames to get freshest frame (reduces lag)
+                        ret, _ = self.cap.read()
+                        if not ret:
+                            break
 
-                # Get the latest frame
-                ret, frame = self.cap.read()
+                    # Get the latest frame
+                    ret, frame = self.cap.read()
 
                 if ret and frame is not None:
                     consecutive_failures = 0
@@ -302,11 +323,12 @@ class CameraManager:
         print("🛑 Ultra-low latency capture thread stopped")
 
     def _capture_frames(self):
-        """Enhanced frame capture with stability improvements"""
+        """Enhanced frame capture with stability improvements - ensures first frame is immediately available"""
         consecutive_failures = 0
         max_failures = 10
         frame_count = 0
         last_frame = None  # Keep last good frame for stability
+        first_frame_processed = False
 
         while self.running and self.cap:
             try:
@@ -320,6 +342,11 @@ class CameraManager:
                     consecutive_failures = 0
                     frame_count += 1
                     last_frame = frame.copy()  # Store last good frame
+                    
+                    # Log first frame to confirm immediate capture
+                    if not first_frame_processed:
+                        first_frame_processed = True
+                        print("✅ First frame captured - Face detection will start immediately")
 
                     # Clear old frames from queue
                     while self.frame_queue.full():

@@ -3,5 +3,7 @@
     "system_name": "IMPEX Check-Out System",
     "database_path": "data/factory_attendance.db",
     "allow_mode_switch": false,
-    "locked_mode": true
+    "locked_mode": true,
+    "checkin_port": 5000,
+    "checkout_port": 8000
 }

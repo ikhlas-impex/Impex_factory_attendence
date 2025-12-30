@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IMPEX Admin Panel - Attendance Management</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+</head>
+<body>
+    <!-- Header -->
+    <header class="admin-header">
+        <div class="header-content">
+            <h1>🔐 IMPEX Admin Panel</h1>
+            <div class="header-info">
+                <span id="currentDate"></span>
+                <span id="currentTime"></span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="admin-nav">
+        <button class="nav-tab active" data-tab="dashboard">📊 Dashboard</button>
+        <button class="nav-tab" data-tab="staff">👥 Staff Management</button>
+        <button class="nav-tab" data-tab="attendance">📋 Attendance Sheet</button>
+        <button class="nav-tab" data-tab="camera">📷 Camera Config</button>
+        <button class="nav-tab" data-tab="realtime">⚡ Real-Time Data</button>
+        <button class="nav-tab" data-tab="unknown">👤 Unknown Entries</button>
+        <button class="nav-tab" data-tab="reports">📈 Reports</button>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="admin-main">
+        <!-- Dashboard Tab -->
+        <div id="tab-dashboard" class="tab-content active">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">👥</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Total Staff</div>
+                        <div class="stat-value" id="stat-total-staff">0</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">✅</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Present Today</div>
+                        <div class="stat-value" id="stat-present">0</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">❌</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Absent Today</div>
+                        <div class="stat-value" id="stat-absent">0</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🚪</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Checked Out</div>
+                        <div class="stat-value" id="stat-checked-out">0</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⏰</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Late Arrivals</div>
+                        <div class="stat-value" id="stat-late">0</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📊</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Attendance Rate</div>
+                        <div class="stat-value" id="stat-rate">0%</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="dashboard-charts">
+                <div class="chart-card">
+                    <h3>Weekly Attendance</h3>
+                    <canvas id="weeklyChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Staff Management Tab -->
+        <div id="tab-staff" class="tab-content">
+            <div class="section-header">
+                <h2>Staff Management</h2>
+                <button class="btn btn-primary" onclick="openAddStaffModal()">➕ Add Staff</button>
+            </div>
+
+            <div class="staff-table-container">
+                <table class="data-table" id="staffTable">
+                    <thead>
+                        <tr>
+                            <th>Photo</th>
+                            <th>Employee ID</th>
+                            <th>Name</th>
+                            <th>Department</th>
+                            <th>Status Today</th>
+                            <th>Check In</th>
+                            <th>Check Out</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="staffTableBody">
+                        <!-- Staff rows will be inserted here -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Attendance Sheet Tab -->
+        <div id="tab-attendance" class="tab-content">
+            <div class="section-header">
+                <h2>Attendance Sheet</h2>
+                <div class="header-actions">
+                    <input type="date" id="attendanceDate" class="date-input" onchange="loadAttendance()">
+                    <button class="btn btn-secondary" onclick="exportAttendance()">📥 Export CSV</button>
+                </div>
+            </div>
+
+            <div class="attendance-filters">
+                <input type="text" id="attendanceSearch" placeholder="Search by name or ID..." class="search-input" onkeyup="filterAttendance()">
+                <select id="attendanceFilter" class="filter-select" onchange="filterAttendance()">
+                    <option value="all">All Status</option>
+                    <option value="present">Present</option>
+                    <option value="absent">Absent</option>
+                    <option value="late">Late</option>
+                </select>
+            </div>
+
+            <div class="attendance-table-container">
+                <table class="data-table" id="attendanceTable">
+                    <thead>
+                        <tr>
+                            <th>Employee ID</th>
+                            <th>Name</th>
+                            <th>Department</th>
+                            <th>Check In</th>
+                            <th>Check Out</th>
+                            <th>Status</th>
+                            <th>Confidence</th>
+                        </tr>
+                    </thead>
+                    <tbody id="attendanceTableBody">
+                        <!-- Attendance rows will be inserted here -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Camera Config Tab -->
+        <div id="tab-camera" class="tab-content">
+            <div class="section-header">
+                <h2>Camera Configuration</h2>
+                <button class="btn btn-primary" onclick="testCamera()">🔍 Test Connection</button>
+            </div>
+
+            <div class="config-form">
+                <div class="form-group">
+                    <label>Camera Source Type:</label>
+                    <select id="cameraSourceType" class="form-input" onchange="toggleCameraFields()">
+                        <option value="usb">USB Webcam</option>
+                        <option value="rtsp">RTSP Camera</option>
+                        <option value="ip">IP Camera</option>
+                    </select>
+                </div>
+
+                <div id="usbCameraFields" class="form-group">
+                    <label>USB Camera Index:</label>
+                    <input type="number" id="usbIndex" class="form-input" value="0" min="0" max="10">
+                    <button class="btn btn-secondary" onclick="detectCameras()">Detect Cameras</button>
+                </div>
+
+                <div id="rtspCameraFields" class="form-group" style="display: none;">
+                    <label>RTSP URL:</label>
+                    <input type="text" id="rtspUrl" class="form-input" placeholder="rtsp://username:password@ip:port/stream">
+                </div>
+
+                <div class="form-group">
+                    <label>Resolution:</label>
+                    <select id="cameraResolution" class="form-input">
+                        <option value="640x480">640x480</option>
+                        <option value="1280x720">1280x720</option>
+                        <option value="1920x1080">1920x1080</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>FPS:</label>
+                    <input type="number" id="cameraFPS" class="form-input" value="30" min="5" max="60">
+                </div>
+
+                <div class="form-group">
+                    <label>Buffer Size:</label>
+                    <input type="number" id="cameraBuffer" class="form-input" value="1" min="1" max="20">
+                </div>
+
+                <div class="form-group">
+                    <label>Transport Protocol:</label>
+                    <select id="cameraTransport" class="form-input">
+                        <option value="TCP">TCP</option>
+                        <option value="UDP">UDP</option>
+                    </select>
+                </div>
+
+                <div class="form-actions">
+                    <button class="btn btn-primary" onclick="saveCameraConfig()">💾 Save Configuration</button>
+                    <button class="btn btn-secondary" onclick="loadCameraConfig()">🔄 Load Current</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Real-Time Data Tab -->
+        <div id="tab-realtime" class="tab-content">
+            <div class="section-header">
+                <h2>Real-Time Attendance Data</h2>
+                <div class="realtime-status">
+                    <span class="status-indicator" id="realtimeStatus">🟢 Live</span>
+                    <span id="lastUpdate">Last update: --</span>
+                </div>
+            </div>
+
+            <div class="realtime-stats">
+                <div class="realtime-stat">
+                    <div class="realtime-label">Total Present</div>
+                    <div class="realtime-value" id="realtimePresent">0</div>
+                </div>
+            </div>
+
+            <div class="recent-checkins">
+                <h3>Recent Check-Ins</h3>
+                <div id="recentCheckinsList" class="checkins-list">
+                    <!-- Recent check-ins will be inserted here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Unknown Entries Tab -->
+        <div id="tab-unknown" class="tab-content">
+            <div class="section-header">
+                <h2>Unknown Entries</h2>
+                <div class="header-actions">
+                    <input type="date" id="unknownEntriesDate" class="date-input" onchange="loadUnknownEntries()">
+                    <button class="btn btn-secondary" onclick="refreshUnknownEntries()">🔄 Refresh</button>
+                </div>
+            </div>
+
+            <div class="unknown-entries-stats">
+                <div class="stat-card-small">
+                    <div class="stat-icon">👤</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Total Today</div>
+                        <div class="stat-value" id="stat-unknown-total">0</div>
+                    </div>
+                </div>
+                <div class="stat-card-small">
+                    <div class="stat-icon">❓</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Unknown Person</div>
+                        <div class="stat-value" id="stat-unknown-person">0</div>
+                    </div>
+                </div>
+                <div class="stat-card-small">
+                    <div class="stat-icon">🎭</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Covered Face</div>
+                        <div class="stat-value" id="stat-covered-face">0</div>
+                    </div>
+                </div>
+                <div class="stat-card-small">
+                    <div class="stat-icon">🚫</div>
+                    <div class="stat-info">
+                        <div class="stat-label">No Face</div>
+                        <div class="stat-value" id="stat-no-face">0</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="unknown-entries-filters">
+                <input type="text" id="unknownEntriesSearch" placeholder="Search by reason or type..." class="search-input" onkeyup="filterUnknownEntries()">
+                <select id="unknownEntriesFilter" class="filter-select" onchange="filterUnknownEntries()">
+                    <option value="all">All Types</option>
+                    <option value="unknown_person">Unknown Person</option>
+                    <option value="covered_face">Covered Face</option>
+                    <option value="no_face">No Face</option>
+                </select>
+                <select id="unknownEntriesStatusFilter" class="filter-select" onchange="filterUnknownEntries()">
+                    <option value="all">All Status</option>
+                    <option value="processed">Processed</option>
+                    <option value="unprocessed">Unprocessed</option>
+                </select>
+                <label style="display: inline-flex; align-items: center; gap: 6px; margin-left: auto; font-size: 14px; cursor: pointer;">
+                    <input type="checkbox" id="unknownSelectAll" onchange="toggleSelectAllUnknownEntries(this)">
+                    <span>Select All</span>
+                </label>
+                <button class="btn btn-danger" style="margin-left: 8px;" onclick="bulkDeleteSelectedUnknownEntries()">
+                    🗑️ Delete Selected
+                </button>
+            </div>
+
+            <div class="unknown-entries-grid" id="unknownEntriesGrid">
+                <!-- Unknown entries will be inserted here -->
+            </div>
+
+            <div id="unknownEntriesEmpty" class="empty-state" style="display: none;">
+                <div class="empty-icon">📭</div>
+                <div class="empty-text">No unknown entries found for this date</div>
+            </div>
+        </div>
+
+        <!-- Reports Tab -->
+        <div id="tab-reports" class="tab-content">
+            <div class="section-header">
+                <h2>Reports & Analytics</h2>
+            </div>
+
+            <div class="reports-section">
+                <div class="report-card">
+                    <h3>Export Attendance Report</h3>
+                    <div class="report-form">
+                        <div class="form-group">
+                            <label>Start Date:</label>
+                            <input type="date" id="reportStartDate" class="form-input">
+                        </div>
+                        <div class="form-group">
+                            <label>End Date:</label>
+                            <input type="date" id="reportEndDate" class="form-input">
+                        </div>
+                        <button class="btn btn-primary" onclick="generateReport()">📊 Generate Report</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Unknown Entry Image Preview Modal -->
+    <div id="unknownImageModal" class="modal">
+        <div class="modal-content" style="max-width: 900px;">
+            <div class="modal-header">
+                <h2>Unknown Entry Preview</h2>
+                <span class="close" onclick="closeUnknownImageModal()">&times;</span>
+            </div>
+            <div class="modal-body" style="text-align: center;">
+                <img id="unknownImageModalImg" src="" alt="Unknown Entry Preview"
+                     style="max-width: 100%; max-height: 80vh; border-radius: 8px; object-fit: contain; background: #000;">
+            </div>
+        </div>
+    </div>
+
+    <!-- Add/Edit Staff Modal -->
+    <div id="staffModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modalTitle">Add Staff Member</h2>
+                <span class="close" onclick="closeStaffModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <form id="staffForm">
+                    <input type="hidden" id="editStaffId">
+                    
+                    <div class="form-group">
+                        <label>Staff ID *</label>
+                        <input type="text" id="staffId" class="form-input" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Full Name *</label>
+                        <input type="text" id="staffName" class="form-input" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Department</label>
+                        <select id="staffDepartment" class="form-input">
+                            <option value="">Select Department</option>
+                            <option value="Reception">Reception</option>
+                            <option value="Housekeeping">Housekeeping</option>
+                            <option value="Security">Security</option>
+                            <option value="Management">Management</option>
+                            <option value="Kitchen">Kitchen</option>
+                            <option value="Maintenance">Maintenance</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Photo *</label>
+                        <div class="photo-upload">
+                            <input type="file" id="staffPhoto" accept="image/*" onchange="previewPhoto(event)" style="display: none;">
+                            <div class="photo-preview" id="photoPreview">
+                                <span>Click to upload photo or capture from camera</span>
+                            </div>
+                            <div style="display: flex; gap: 10px; margin-top: 10px;">
+                                <button type="button" class="btn btn-secondary" onclick="document.getElementById('staffPhoto').click()">📁 Choose Photo</button>
+                                <button type="button" class="btn btn-primary" onclick="openCameraCapture()">📷 Capture from Camera</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary">💾 Save</button>
+                        <button type="button" class="btn btn-secondary" onclick="closeStaffModal()">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Camera Capture Modal -->
+    <div id="cameraModal" class="modal">
+        <div class="modal-content" style="max-width: 900px;">
+            <div class="modal-header">
+                <h2>Capture Photos from Camera (5 Angles)</h2>
+                <span class="close" onclick="closeCameraModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div id="cameraContainer" style="text-align: center; margin: 20px 0;">
+                    <img id="cameraStream" src="/api/admin/camera/stream" alt="Camera Stream" 
+                         style="max-width: 100%; max-height: 500px; border: 2px solid #ddd; border-radius: 8px;">
+                </div>
+                <div style="text-align: center; margin: 10px 0;">
+                    <div id="photoCountDisplay" style="font-size: 18px; font-weight: bold; color: #667eea; margin: 10px 0;">
+                        Photos Captured: <span id="photoCount">0</span>/5
+                    </div>
+                    <div id="captureInstructions" style="font-size: 14px; color: #666; margin: 10px 0; min-height: 40px;">
+                        Position yourself in front of the camera and look straight ahead
+                    </div>
+                </div>
+                <div style="text-align: center; margin: 20px 0;">
+                    <button id="captureBtn" class="btn btn-primary" onclick="capturePhoto()" style="font-size: 16px; padding: 12px 24px;">
+                        📸 Capture Photo 1/5
+                    </button>
+                    <button id="clearBtn" class="btn btn-warning" onclick="clearCapturedPhotos()" style="font-size: 16px; padding: 12px 24px; margin-left: 10px; display: none;">
+                        🔄 Clear All
+                    </button>
+                    <button id="finishBtn" class="btn btn-success" onclick="finishCapture()" style="font-size: 16px; padding: 12px 24px; margin-left: 10px; display: none;">
+                        ✅ Finish (Use Photos)
+                    </button>
+                    <button class="btn btn-secondary" onclick="closeCameraModal()" style="font-size: 16px; padding: 12px 24px; margin-left: 10px;">
+                        Cancel
+                    </button>
+                </div>
+                <div id="captureStatus" style="text-align: center; margin: 10px 0; color: #666;"></div>
+                <div id="capturedPhotosPreview" style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin: 20px 0; max-height: 150px; overflow-y: auto;">
+                    <!-- Captured photos thumbnails will appear here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/admin.js') }}"></script>
+</body>
+</html>
+

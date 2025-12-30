@@ -8,6 +8,10 @@ Runs on port 5000, locked to check-in mode
 import sys
 import os
 
+# Explicitly mark this process as the CHECK-IN server so configuration
+# (especially camera selection) can be mode-specific without conflicts.
+os.environ["IMPEX_SYSTEM_MODE"] = "checkin"
+
 # Add current directory to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -17,15 +21,19 @@ if current_dir not in sys.path:
 if __name__ == '__main__':
     # Import web_app module
     import web_app
+    from core.config_manager import ConfigManager
+    
+    # Get port from config before initializing
+    config = ConfigManager()
+    system_config = config.get_system_config()
+    port = system_config.get('checkin_port', 5000)
     
     # Initialize system with check-in mode locked
     if not web_app.init_system(forced_mode='checkin'):
         print("❌ Failed to initialize check-in system")
         sys.exit(1)
     
-    # Run on port 5000
     host = '0.0.0.0'
-    port = 5000
     
     print("=" * 70)
     print("🌐 IMPEX ATTENDANCE SYSTEM - CHECK-IN SERVER")

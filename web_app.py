@@ -14,6 +14,23 @@ import cv2
 import numpy as np
 from PIL import Image
 import io
+import mediapipe as mp
+
+# Setup Python path BEFORE importing core modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+src_dir = os.path.join(current_dir, 'src')
+
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+from core.deepsort_tracker import DeepSort, Detection as DSDetection
+from core.face_engine import FaceRecognitionEngine
+from core.database_manager import DatabaseManager
+from core.config_manager import ConfigManager
+from utils.camera_utils import CameraManager
+from utils.gpu_utils import detect_gpu_capability
 
 # CRITICAL: Set environment variables BEFORE any imports
 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
@@ -32,22 +49,6 @@ os.environ['OPENCV_VIDEOIO_PRIORITY_OBSENSOR'] = '0'
 os.environ['OPENCV_VIDEOIO_DEBUG'] = '0'
 os.environ['OPENCV_VIDEOIO_PRIORITY_FFMPEG'] = '1000'
 os.environ['OPENCV_VIDEOIO_PRIORITY_DIRECTSHOW'] = '900'
-
-# Setup Python path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.join(current_dir, 'src')
-
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-if src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
-
-# Import core modules
-from core.face_engine import FaceRecognitionEngine
-from core.database_manager import DatabaseManager
-from core.config_manager import ConfigManager
-from utils.camera_utils import CameraManager
-from utils.gpu_utils import detect_gpu_capability
 
 app = Flask(__name__, 
            template_folder='templates',
@@ -69,6 +70,144 @@ captured_photos = {}
 employee_id_map = {}
 system_mode = 'checkin'  # Default mode
 is_locked = False
+recent_track_roles = {}  # track_id -> 'staff' or 'unknown'
+simple_tracks = []       # legacy lightweight tracker state (kept for fallback)
+next_track_id = 1        # incremental track id
+
+# DeepSort-style appearance-based tracker for stable IDs
+deepsort_tracker = DeepSort()
+track_states = {}  # track_id -> dict with staff/unknown history
+
+# MediaPipe face detection + unknown-embedding cache
+_mp_face_detector = None
+recent_unknowns = []  # list of dicts: {'embedding': np.ndarray, 'ts': float}
+
+
+def init_mediapipe_face_detector(min_detection_confidence: float = 0.5):
+    """Initialize a global MediaPipe face detector (server-side), if available.
+
+    This is used as an auxiliary detector/tracker and to satisfy the
+    requirement of integrating MediaPipe into the web tracking pipeline.
+    It is written defensively to support different MediaPipe versions.
+    """
+    global _mp_face_detector
+    if _mp_face_detector is not None:
+        return _mp_face_detector
+
+    try:
+        # Prefer the classic solutions API if present
+        from mediapipe import solutions as mp_solutions
+        FaceDetectionClass = mp_solutions.face_detection.FaceDetection
+        _mp_face_detector = FaceDetectionClass(
+            model_selection=0,
+            min_detection_confidence=min_detection_confidence
+        )
+        print("✅ MediaPipe FaceDetection (solutions API) initialized for web tracking.")
+    except Exception as e:
+        # If this fails (e.g., new Tasks-only build), log and disable MediaPipe usage.
+        print(f"⚠️ MediaPipe FaceDetection not available or incompatible: {e}")
+
+        # #region agent log
+        try:
+            import json as _json, time as _time
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "mediapipe-init",
+                "hypothesisId": "H1",
+                "location": "web_app.py:init_mediapipe_face_detector",
+                "message": "MediaPipe FaceDetection init failed",
+                "data": {
+                    "exception": str(e),
+                    "mediapipe_dir": getattr(mp, "__file__", None),
+                },
+                "timestamp": int(_time.time() * 1000),
+            }
+            with open(r"c:\Users\ADMIN\Desktop\Impex Projects\impex_factory\Impex_factory_attendence\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(_json.dumps(log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion agent log
+
+        _mp_face_detector = None
+
+    return _mp_face_detector
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute cosine similarity between two 1D vectors."""
+    if a is None or b is None:
+        return 0.0
+    if a.ndim != 1 or b.ndim != 1:
+        a = a.reshape(-1)
+        b = b.reshape(-1)
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a / na, b / nb))
+
+
+def is_same_unknown(embedding: np.ndarray,
+                    similarity_threshold: float = 0.7,
+                    max_age_seconds: float = 300.0) -> bool:
+    """
+    Check if an unknown face embedding matches a recently-seen unknown.
+
+    This prevents the same unknown person from being recorded multiple times
+    in a short time window, even if the tracker temporarily loses them.
+    """
+    global recent_unknowns
+    if embedding is None:
+        return False
+
+    now = time.time()
+    # Keep only recent entries
+    recent_unknowns = [
+        item for item in recent_unknowns
+        if now - item["ts"] <= max_age_seconds
+    ]
+
+    if not recent_unknowns:
+        recent_unknowns.append({"embedding": embedding, "ts": now})
+        return False
+
+    for item in recent_unknowns:
+        sim = _cosine_similarity(embedding, item["embedding"])
+        if sim >= similarity_threshold:
+            # Same physical unknown person seen again → treat as duplicate
+            return True
+
+    # New unknown person
+    recent_unknowns.append({"embedding": embedding, "ts": now})
+    return False
+
+
+def is_probable_staff_from_embedding(embedding: np.ndarray,
+                                     similarity_threshold: float = 0.6) -> bool:
+    """
+    Check if an embedding is reasonably close to any known staff embedding.
+
+    This acts as a safety net so that a registered staff is not recorded
+    as an unknown entry when recognition confidence is slightly below
+    the normal threshold or when the tracker briefly loses the face.
+    """
+    if embedding is None or face_engine is None:
+        return False
+
+    try:
+        staff_db = getattr(face_engine, "staff_database", None)
+        if not staff_db:
+            return False
+
+        # Re-use the optimized matcher from FaceRecognitionEngine
+        match_id, score = face_engine._match_against_database(embedding, staff_db)
+        if match_id and score >= similarity_threshold:
+            return True
+    except Exception as e:
+        # Fail safe: if anything goes wrong, don't block unknowns
+        print(f"Staff similarity check error: {e}")
+
+    return False
 
 def init_system(forced_mode=None):
     """Initialize system components
@@ -160,49 +299,336 @@ def get_employee_id(staff_id):
     """Get employee ID for staff"""
     return employee_id_map.get(staff_id, staff_id.replace('STAFF_', '') if staff_id.startswith('STAFF_') else staff_id)
 
+def is_good_frame(frame):
+    """Check if frame is good quality for processing (not too blurry or dark)"""
+    if frame is None:
+        return False
+    
+    # Convert to grayscale for analysis
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    
+    # Check brightness (avoid too dark frames)
+    mean_brightness = np.mean(gray)
+    if mean_brightness < 30:  # Too dark
+        return False
+    
+    # Check blur using Laplacian variance (simple and fast)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if laplacian_var < 50:  # Too blurry
+        return False
+    
+    return True
+def _bbox_iou(b1, b2):
+    """Compute IoU between two [x1, y1, x2, y2] boxes."""
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
+    inter_w = max(0, x2 - x1)
+    inter_h = max(0, y2 - y1)
+    inter = inter_w * inter_h
+    if inter <= 0:
+        return 0.0
+    area1 = max(0, (b1[2] - b1[0])) * max(0, (b1[3] - b1[1]))
+    area2 = max(0, (b2[2] - b2[0])) * max(0, (b2[3] - b2[1]))
+    union = area1 + area2 - inter
+    if union <= 0:
+        return 0.0
+    return float(inter) / float(union)
+
+
+def assign_simple_tracks(bboxes, max_stale_seconds=5.0, iou_threshold=0.3):
+    """
+    Legacy IoU-only tracker (kept for fallback / reference). The main tracker
+    used by the system is now DeepSort (see deepsort_tracker).
+    """
+    global simple_tracks, next_track_id
+    now = time.time()
+
+    # Drop stale tracks
+    simple_tracks = [t for t in simple_tracks if now - t["last_seen"] <= max_stale_seconds]
+
+    assigned_ids = []
+    used_track_ids = set()
+
+    for bbox in bboxes:
+        bbox = list(map(float, bbox))
+        best_iou = 0.0
+        best_track = None
+
+        for t in simple_tracks:
+            if t["id"] in used_track_ids:
+                continue
+            iou = _bbox_iou(bbox, t["bbox"])
+            if iou > best_iou:
+                best_iou = iou
+                best_track = t
+
+        if best_track is not None and best_iou >= iou_threshold:
+            # Reuse existing track
+            best_track["bbox"] = bbox
+            best_track["last_seen"] = now
+            track_id = best_track["id"]
+            used_track_ids.add(track_id)
+        else:
+            # Start new track
+            track_id = next_track_id
+            next_track_id += 1
+            simple_tracks.append({"id": track_id, "bbox": bbox, "last_seen": now})
+            used_track_ids.add(track_id)
+
+        assigned_ids.append(track_id)
+
+    return assigned_ids
+
+
+def _get_or_create_track_state(track_id: int):
+    """
+    Internal helper to retrieve or create a per-track state object.
+
+    State fields:
+        first_seen: timestamp when track was first created
+        last_seen: last update timestamp
+        consecutive_staff_frames: number of consecutive frames with strong staff recognition
+        locked_staff: bool - once True, this track is always treated as staff
+        staff_id: best staff_id assigned to this track
+        best_staff_score: highest recognition score seen for staff
+        has_staff_like_match: whether this track ever had an embedding close to staff
+        unknown_recorded: whether an unknown DB record was already written
+        best_unknown_frame: cached best-quality frame for unknown snapshot
+        best_unknown_bbox: bbox associated with best_unknown_frame
+        best_unknown_conf: best detection confidence seen for unknown
+    """
+    now = time.time()
+    state = track_states.get(track_id)
+    if state is None:
+        state = {
+            "first_seen": now,
+            "last_seen": now,
+            "consecutive_staff_frames": 0,
+            "locked_staff": False,
+            "staff_id": None,
+            "best_staff_score": 0.0,
+            "has_staff_like_match": False,
+            "unknown_recorded": False,
+            "best_unknown_frame": None,
+            "best_unknown_bbox": None,
+            "best_unknown_conf": 0.0,
+        }
+        track_states[track_id] = state
+    else:
+        state["last_seen"] = now
+    return state
+
+
+def _prune_stale_track_states(max_age_seconds: float = 5.0):
+    """Remove per-track states that have not been updated recently."""
+    now = time.time()
+    stale_ids = [
+        tid for tid, st in track_states.items()
+        if now - st.get("last_seen", now) > max_age_seconds
+    ]
+    for tid in stale_ids:
+        track_states.pop(tid, None)
+
 def process_video_loop():
-    """Process video frames in background thread"""
+    """Process video frames in background thread with smart frame skipping"""
     global current_frame, current_detections, running, face_engine
+    
+    # FPS tracking for terminal output
+    fps_counter = 0
+    fps_start_time = time.time()
+    last_fps_print = time.time()
+    frame_counter = 0
+    processed_frames = 0
+    
+    # Frame skipping configuration
+    # On GPU we can afford slightly higher detection frequency while keeping things stable.
+    FRAME_SKIP_INTERVAL = 2  # Process every 2nd frame for detection
+    MIN_PROCESS_INTERVAL = 0.06  # Minimum 0.06s between detections (~16 FPS max detection rate)
+    last_detection_time = 0
     
     while running:
         try:
             frame = camera_manager.get_frame()
             if frame is None:
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
             
+            frame_counter += 1
+            fps_counter += 1
+            
+            # Always update display frame for smooth video
             with frame_lock:
                 current_frame = frame.copy()
             
-            # Detect faces
-            if face_engine:
+            # Smart frame skipping: only process good frames at intervals
+            current_time = time.time()
+            should_process = (
+                frame_counter % FRAME_SKIP_INTERVAL == 0 and  # Every Nth frame
+                (current_time - last_detection_time) >= MIN_PROCESS_INTERVAL and  # Time-based throttling
+                is_good_frame(frame)  # Quality check
+            )
+            
+            # Detect faces only on selected frames
+            if should_process and face_engine:
+                processed_frames += 1
+                last_detection_time = current_time
+                
+                # Ensure MediaPipe is initialized (for integration / auxiliary checks)
+                mp_detector = init_mediapipe_face_detector()
+                if mp_detector is not None:
+                    try:
+                        _ = mp_detector.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    except Exception as _e:
+                        # If MediaPipe processing fails, continue with main pipeline.
+                        pass
+
                 detections = face_engine.detect_faces(frame)
                 detection_info = []
-                
-                for detection in detections:
+
+                # Build DeepSort detections (appearance features come from embeddings)
+                ds_detections = []
+                for d in detections:
+                    try:
+                        ds_detections.append(DSDetection(d['bbox'], d['embedding']))
+                    except Exception:
+                        # Skip malformed detections gracefully
+                        continue
+
+                ds_tracks = deepsort_tracker.update(ds_detections) if ds_detections else []
+
+                # Map DeepSort track outputs back to our detections via IoU
+                det_bboxes = [d['bbox'] for d in detections]
+                track_ids = [None] * len(detections)
+                for track_id, t_bbox, _feat in ds_tracks:
+                    best_iou = 0.0
+                    best_idx = None
+                    for idx, det_bbox in enumerate(det_bboxes):
+                        iou = _bbox_iou(det_bbox, t_bbox)
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_idx = idx
+                    if best_idx is not None and best_iou >= 0.3 and track_ids[best_idx] is None:
+                        track_ids[best_idx] = int(track_id)
+
+                for det_idx, detection in enumerate(detections):
                     bbox = detection['bbox']
                     embedding = detection['embedding']
                     det_confidence = detection.get('confidence', 0.0)
-                    
+                    track_id = track_ids[det_idx] if det_idx < len(track_ids) else None
+
                     # Identify person
                     person_type, person_id, rec_confidence = face_engine.identify_person(embedding)
-                    
+
+                    # Track-level state for stronger staff/unknown decisions
+                    if track_id is not None:
+                        state = track_states.get(track_id)
+                        if state is None:
+                            state = {
+                                "first_seen": current_time,
+                                "staff_id": None,
+                                "best_staff_score": 0.0,
+                                "stable_staff_frames": 0,
+                                "staff_confirmed": False,
+                                "unknown_recorded": False,
+                            }
+                            track_states[track_id] = state
+
                     detection_info.append({
                         'bbox': bbox.tolist() if isinstance(bbox, np.ndarray) else list(bbox),
                         'confidence': float(det_confidence),
                         'person_type': person_type,
                         'person_id': person_id,
-                        'recognition_confidence': float(rec_confidence) if rec_confidence else 0.0
+                        'recognition_confidence': float(rec_confidence) if rec_confidence else 0.0,
+                        'track_id': int(track_id) if track_id is not None else None,
                     })
-                    
-                    # Process attendance for staff
+
+                    # If confidently recognized as staff, mark this track as staff and record attendance
                     if person_type == 'staff' and person_id and rec_confidence >= 0.55:
+                        if track_id is not None:
+                            recent_track_roles[track_id] = 'staff'
+                            state = track_states.get(track_id)
+                            if state:
+                                # Update staff history for this track
+                                if state["staff_id"] is None or state["staff_id"] == person_id:
+                                    state["staff_id"] = person_id
+                                    state["best_staff_score"] = max(state["best_staff_score"], float(rec_confidence))
+                                    state["stable_staff_frames"] += 1
+                                    if state["stable_staff_frames"] >= 2:
+                                        state["staff_confirmed"] = True
+                                else:
+                                    # Different staff ID appearing on same track: reset history
+                                    state["staff_id"] = person_id
+                                    state["best_staff_score"] = float(rec_confidence)
+                                    state["stable_staff_frames"] = 1
+                                    state["staff_confirmed"] = False
+                                # Once staff is confirmed, never allow unknown recording for this track
+                                state["unknown_recorded"] = False
                         process_attendance(person_id, frame, bbox, rec_confidence)
+                    # For unknown / low-confidence detections, avoid recording as unknown
+                    # if this track was already seen as staff recently.
+                    elif person_type in ('unknown', 'staff'):
+                        if track_id is not None and recent_track_roles.get(track_id) == 'staff':
+                            # Same physical track already known as staff → skip unknown entry
+                            continue
+                        # If track history says staff is confirmed for this track, never downgrade to unknown
+                        if track_id is not None:
+                            state = track_states.get(track_id)
+                            if state and state.get("staff_confirmed"):
+                                continue
+                        # Safety net: if this embedding still matches a staff member
+                        # reasonably well, don't log it as unknown.
+                        if is_probable_staff_from_embedding(embedding):
+                            continue
+
+                        # Only consider unknown after the track has had time to stabilize
+                        if track_id is not None:
+                            state = track_states.get(track_id)
+                            if state:
+                                track_age = current_time - state.get("first_seen", current_time)
+                                if track_age < 0.8:  # wait ~0.8s before deciding unknown
+                                    continue
+                                if state.get("unknown_recorded"):
+                                    # Already recorded one unknown for this track
+                                    continue
+
+                        # Embedding-based deduplication for unknown persons
+                        if person_type == 'unknown' or (person_type == 'staff' and (rec_confidence or 0.0) < 0.55):
+                            if is_same_unknown(embedding):
+                                # Same unknown person already recorded recently → skip
+                                continue
+
+                        process_unknown_entry(
+                            frame,
+                            bbox,
+                            det_confidence,
+                            rec_confidence,
+                            person_type,
+                            track_id
+                        )
+
+                        if track_id is not None:
+                            state = track_states.get(track_id)
+                            if state:
+                                state["unknown_recorded"] = True
                 
                 with frame_lock:
                     current_detections = detection_info
             
-            time.sleep(0.03)  # ~30 FPS processing
+            # Calculate and print FPS to terminal every second
+            if current_time - last_fps_print >= 1.0:
+                elapsed = current_time - fps_start_time
+                if elapsed > 0:
+                    fps = fps_counter / elapsed
+                    detection_fps = processed_frames / elapsed if processed_frames > 0 else 0
+                    print(f"📊 FPS: {fps:.1f} | Detection FPS: {detection_fps:.1f} | Total: {frame_counter} | Processed: {processed_frames}")
+                    fps_counter = 0
+                    processed_frames = 0
+                    fps_start_time = current_time
+                last_fps_print = current_time
+            
+            time.sleep(0.01)  # Fast frame capture for smooth display
         except Exception as e:
             print(f"Processing error: {e}")
             time.sleep(0.1)
@@ -243,6 +669,110 @@ def process_attendance(staff_id, frame, bbox, confidence):
             
     except Exception as e:
         print(f"Attendance processing error: {e}")
+
+def process_unknown_entry(frame, bbox, det_confidence, rec_confidence, person_type, track_id=None):
+    """Process and record unknown entries (persons not recognized as staff)
+    
+    Args:
+        frame: full video frame (numpy array)
+        bbox: face bounding box
+        det_confidence: face detection confidence
+        rec_confidence: recognition confidence
+        person_type: 'unknown' or 'staff' (low confidence)
+        track_id: stable track identifier (if None, will be generated from bbox)
+    """
+    global db_manager, system_mode
+    
+    try:
+        if not db_manager:
+            return
+        
+        current_time = time.time()
+        
+        # Debounce: only process once per N seconds per track_id
+        if not hasattr(process_unknown_entry, 'last_processed'):
+            process_unknown_entry.last_processed = {}
+        
+        # Normalize track_id to int when provided; we no longer synthesize IDs
+        # from the bbox, because unknown-person deduplication is handled by
+        # embedding similarity in is_same_unknown().
+        if track_id is not None:
+            track_id = int(track_id)
+        
+        # Check if we've processed this track recently
+        last_time = process_unknown_entry.last_processed.get(track_id, 0)
+        # Increase debounce window so the same person is not saved many times
+        if current_time - last_time < 180.0:  # 180 seconds debounce
+            return
+        
+        process_unknown_entry.last_processed[track_id] = current_time
+        
+        # Determine entry type and reason
+        entry_type = 'unknown_person'
+        reason = 'Face detected but not recognized as staff'
+        has_face = det_confidence > 0.3
+        
+        if det_confidence < 0.3:
+            entry_type = 'covered_face'
+            reason = 'Face partially covered or low detection confidence'
+        elif rec_confidence < 0.5 and rec_confidence > 0:
+            entry_type = 'unknown_person'
+            reason = 'Face detected but person not in staff database'
+        elif not has_face:
+            entry_type = 'no_face'
+            reason = 'No face detected'
+        
+        # Expand bounding box to capture full body
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = map(int, bbox)
+        face_height = max(1, y2 - y1)
+        face_width = max(1, x2 - x1)
+        
+        # Expand to capture full body (estimated)
+        expand_down = int(face_height * 6)
+        expand_up = int(face_height * 1.5)
+        expand_sides = int(face_width * 1.5)
+        
+        # Calculate full body bounding box
+        body_x1 = max(0, x1 - expand_sides)
+        body_y1 = max(0, y1 - expand_up)
+        body_x2 = min(w, x2 + expand_sides)
+        body_y2 = min(h, y2 + expand_down)
+        
+        # Extract full body image
+        full_body_image = frame[body_y1:body_y2, body_x1:body_x2].copy()
+        
+        # Make sure we have a valid image
+        if full_body_image.size == 0 or full_body_image.shape[0] < 50 or full_body_image.shape[1] < 50:
+            # Fallback: use face bounding box with some expansion
+            full_body_image = frame[max(0, y1-20):min(h, y2+20), max(0, x1-20):min(w, x2+20)].copy()
+        
+        if full_body_image.size == 0:
+            return
+        
+        # Record unknown entry in database
+        entry_id = db_manager.record_unknown_entry(
+            track_id=track_id,
+            entry_type=entry_type,
+            frame_image=full_body_image,
+            face_bbox=[x1, y1, x2, y2],
+            person_bbox=[body_x1, body_y1, body_x2, body_y2],
+            face_detected=has_face,
+            face_confidence=float(det_confidence),
+            recognition_confidence=float(rec_confidence),
+            reason=reason,
+            system_mode=system_mode
+        )
+        
+        if entry_id:
+            print(f"✅ Unknown entry recorded: Entry ID {entry_id}, Track ID {track_id}, Type: {entry_type}, Reason: {reason}")
+        else:
+            print(f"❌ Failed to record unknown entry: Track ID {track_id}")
+            
+    except Exception as e:
+        print(f"❌ Error processing unknown entry: {e}")
+        import traceback
+        traceback.print_exc()
 
 def record_checkin(staff_id, check_time, confidence):
     """Record check-in"""

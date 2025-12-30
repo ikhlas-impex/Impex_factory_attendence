@@ -8,3 +8,5 @@ Pillow
 pandas
 Flask>=2.3.0
 flask-cors>=4.0.0
+onnxruntime-gpu==1.22.0
+mediapipe>=0.10.0

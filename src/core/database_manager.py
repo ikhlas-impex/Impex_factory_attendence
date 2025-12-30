@@ -140,6 +140,38 @@ class DatabaseManager:
                     )
                 ''')
                 
+                # Unknown entries table for tracking unrecognized persons
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS unknown_entries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        track_id INTEGER,
+                        entry_type TEXT NOT NULL,
+                        detection_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        date TEXT NOT NULL,
+                        time TEXT NOT NULL,
+                        full_body_image BLOB NOT NULL,
+                        face_bbox TEXT,
+                        person_bbox TEXT,
+                        face_detected BOOLEAN DEFAULT 0,
+                        face_confidence REAL,
+                        recognition_confidence REAL,
+                        reason TEXT,
+                        system_mode TEXT,
+                        is_processed BOOLEAN DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Index for faster queries
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_unknown_entries_date 
+                    ON unknown_entries(date DESC, detection_time DESC)
+                ''')
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_unknown_entries_track_id 
+                    ON unknown_entries(track_id)
+                ''')
+                
                 conn.commit()
                 conn.close()
                 print("✅ Database tables created successfully")
@@ -1070,6 +1102,268 @@ class DatabaseManager:
         except Exception as e:
             print(f"❌ Error getting staff photo: {e}")
             return None
+    
+    def record_unknown_entry(self, track_id, entry_type, frame_image, face_bbox=None, person_bbox=None, 
+                             face_detected=False, face_confidence=0.0, recognition_confidence=0.0, 
+                             reason='', system_mode='checkin'):
+        """
+        Record an unknown entry (person without recognized face or with covered face)
+        
+        Args:
+            track_id: Unique tracking ID for the person
+            entry_type: 'no_face', 'unknown_person', or 'covered_face'
+            frame_image: Full body image (numpy array)
+            face_bbox: Face bounding box [x1, y1, x2, y2] or None
+            person_bbox: Person bounding box [x1, y1, x2, y2] or None
+            face_detected: Whether a face was detected
+            face_confidence: Face detection confidence
+            recognition_confidence: Face recognition confidence (if face was detected)
+            reason: Reason for unknown entry
+            system_mode: 'checkin' or 'checkout'
+        
+        Returns:
+            entry_id if successful, None otherwise
+        """
+        try:
+            import cv2
+            import json
+            from datetime import datetime
+            
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                # Check if we already have an entry for this track_id today (to avoid duplicates)
+                today = date.today().isoformat()
+                cursor.execute('''
+                    SELECT id FROM unknown_entries 
+                    WHERE track_id = ? AND date = ? AND is_processed = 0
+                ''', (track_id, today))
+                
+                existing = cursor.fetchone()
+                if existing:
+                    # Update existing entry with latest image and time
+                    now = datetime.now()
+                    time_str = now.strftime('%H:%M:%S')
+                    
+                    # Encode image
+                    success, buffer = cv2.imencode('.jpg', frame_image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if not success:
+                        conn.close()
+                        return None
+                    
+                    image_blob = buffer.tobytes()
+                    
+                    # Update existing entry
+                    cursor.execute('''
+                        UPDATE unknown_entries 
+                        SET detection_time = ?,
+                            time = ?,
+                            full_body_image = ?,
+                            face_bbox = ?,
+                            person_bbox = ?,
+                            face_detected = ?,
+                            face_confidence = ?,
+                            recognition_confidence = ?,
+                            reason = ?,
+                            system_mode = ?
+                        WHERE id = ?
+                    ''', (
+                        now, time_str, image_blob,
+                        json.dumps(face_bbox) if face_bbox else None,
+                        json.dumps(person_bbox) if person_bbox else None,
+                        face_detected, face_confidence, recognition_confidence,
+                        reason, system_mode, existing[0]
+                    ))
+                    
+                    conn.commit()
+                    conn.close()
+                    return existing[0]
+                else:
+                    # Create new entry
+                    now = datetime.now()
+                    date_str = today
+                    time_str = now.strftime('%H:%M:%S')
+                    
+                    # Encode image
+                    success, buffer = cv2.imencode('.jpg', frame_image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if not success:
+                        conn.close()
+                        return None
+                    
+                    image_blob = buffer.tobytes()
+                    
+                    cursor.execute('''
+                        INSERT INTO unknown_entries 
+                        (track_id, entry_type, date, time, full_body_image, face_bbox, person_bbox,
+                         face_detected, face_confidence, recognition_confidence, reason, system_mode)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        track_id, entry_type, date_str, time_str, image_blob,
+                        json.dumps(face_bbox) if face_bbox else None,
+                        json.dumps(person_bbox) if person_bbox else None,
+                        face_detected, face_confidence, recognition_confidence,
+                        reason, system_mode
+                    ))
+                    
+                    entry_id = cursor.lastrowid
+                    conn.commit()
+                    conn.close()
+                    
+                    print(f"✅ Unknown entry recorded in database: Entry ID {entry_id}, Track ID {track_id}, Type: {entry_type}, Date: {date_str}, Time: {time_str}, Reason: {reason}")
+                    return entry_id
+                    
+        except Exception as e:
+            print(f"❌ Error recording unknown entry: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def get_unknown_entries(self, date_filter=None, limit=100):
+        """
+        Get unknown entries
+        
+        Args:
+            date_filter: Date string (YYYY-MM-DD) or None for all dates
+            limit: Maximum number of entries to return
+        
+        Returns:
+            List of unknown entry dictionaries
+        """
+        try:
+            import cv2
+            import json
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                if date_filter:
+                    cursor.execute('''
+                        SELECT id, track_id, entry_type, date, time, detection_time,
+                               face_bbox, person_bbox, face_detected, face_confidence,
+                               recognition_confidence, reason, system_mode, is_processed
+                        FROM unknown_entries
+                        WHERE date = ?
+                        ORDER BY detection_time DESC
+                        LIMIT ?
+                    ''', (date_filter, limit))
+                else:
+                    cursor.execute('''
+                        SELECT id, track_id, entry_type, date, time, detection_time,
+                               face_bbox, person_bbox, face_detected, face_confidence,
+                               recognition_confidence, reason, system_mode, is_processed
+                        FROM unknown_entries
+                        ORDER BY detection_time DESC
+                        LIMIT ?
+                    ''', (limit,))
+                
+                entries = []
+                for row in cursor.fetchall():
+                    try:
+                        # Parse JSON fields safely
+                        face_bbox = None
+                        person_bbox = None
+                        if row[6]:
+                            try:
+                                face_bbox = json.loads(row[6])
+                            except (json.JSONDecodeError, TypeError):
+                                print(f"⚠️ Warning: Could not parse face_bbox for entry {row[0]}: {row[6]}")
+                        
+                        if row[7]:
+                            try:
+                                person_bbox = json.loads(row[7])
+                            except (json.JSONDecodeError, TypeError):
+                                print(f"⚠️ Warning: Could not parse person_bbox for entry {row[0]}: {row[7]}")
+                        
+                        entries.append({
+                            'id': row[0],
+                            'track_id': row[1],
+                            'entry_type': row[2],
+                            'date': row[3],
+                            'time': row[4],
+                            'detection_time': row[5] if row[5] else row[4],  # Fallback to time if detection_time is None
+                            'face_bbox': face_bbox,
+                            'person_bbox': person_bbox,
+                            'face_detected': bool(row[8]) if row[8] is not None else False,
+                            'face_confidence': float(row[9]) if row[9] is not None else 0.0,
+                            'recognition_confidence': float(row[10]) if row[10] is not None else 0.0,
+                            'reason': row[11] if row[11] else 'Unknown',
+                            'system_mode': row[12] if row[12] else 'checkin',
+                            'is_processed': bool(row[13]) if row[13] is not None else False
+                        })
+                    except Exception as e:
+                        print(f"⚠️ Error processing unknown entry row {row[0]}: {e}")
+                        continue
+                
+                print(f"✅ Successfully processed {len(entries)} unknown entries from database")
+                conn.close()
+                return entries
+                
+        except Exception as e:
+            print(f"❌ Error getting unknown entries: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def get_unknown_entry_image(self, entry_id):
+        """Get full body image for an unknown entry"""
+        try:
+            import cv2
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                cursor.execute('SELECT full_body_image FROM unknown_entries WHERE id = ?', (entry_id,))
+                row = cursor.fetchone()
+                conn.close()
+                
+                if row and row[0]:
+                    # Convert bytes back to image
+                    nparr = np.frombuffer(row[0], np.uint8)
+                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    return img if img is not None else None
+                
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error getting unknown entry image: {e}")
+            return None
+    
+    def mark_unknown_entry_processed(self, entry_id):
+        """Mark an unknown entry as processed"""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    UPDATE unknown_entries SET is_processed = 1 WHERE id = ?
+                ''', (entry_id,))
+                
+                conn.commit()
+                conn.close()
+                return True
+                
+        except Exception as e:
+            print(f"❌ Error marking entry as processed: {e}")
+            return False
+    
+    def delete_unknown_entry(self, entry_id):
+        """Delete an unknown entry"""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                cursor.execute('DELETE FROM unknown_entries WHERE id = ?', (entry_id,))
+                
+                conn.commit()
+                conn.close()
+                return True
+                
+        except Exception as e:
+            print(f"❌ Error deleting unknown entry: {e}")
+            return False
 
 # Test the database manager if run directly
 if __name__ == "__main__":

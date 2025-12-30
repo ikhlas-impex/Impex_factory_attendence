@@ -337,9 +337,11 @@ function createEmployeeCard(item, mode) {
         img.alt = 'Employee Photo';
         photoContainer.appendChild(img);
     } else {
-        const placeholder = document.createElement('div');
-        placeholder.className = 'photo-placeholder';
-        photoContainer.appendChild(placeholder);
+        const placeholderImg = document.createElement('img');
+        placeholderImg.src = '/static/icons/Clip path group.png';
+        placeholderImg.alt = 'User Icon';
+        placeholderImg.className = 'photo-placeholder-icon';
+        photoContainer.appendChild(placeholderImg);
     }
     
     // Info container (dark brown bottom section)

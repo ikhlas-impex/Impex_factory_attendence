@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (if contains sensitive data)
+# config/camera_settings.json
+# config/network_settings.json
+
+# Data backups
+data/backups/
+data/reports/
+
+# Build files
+build/
+dist/
+*.egg-info/
+

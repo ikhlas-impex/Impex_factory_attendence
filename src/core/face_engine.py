@@ -33,8 +33,12 @@ class FaceRecognitionEngine:
         # Enhanced processing settings
         self.processing_resolution = (640, 480)  # Better balance of speed vs accuracy
 
-        # Initialize InsightFace with optimal settings
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if gpu_mode else ['CPUExecutionProvider']
+        # Initialize InsightFace with GPU-first providers; hard-prefer CUDA when available.
+        # Avoid TensorRT here because missing TensorRT DLLs can force a full fallback to CPU.
+        if gpu_mode:
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        else:
+            providers = ['CPUExecutionProvider']
 
         try:
             self.app = FaceAnalysis(
@@ -42,16 +46,37 @@ class FaceRecognitionEngine:
                 providers=providers
             )
 
-            # Optimal detection size for accuracy[75]
-            # Adjust detection size for better compatibility with various camera resolutions
-            det_size = (960, 960) if gpu_mode else (640, 640)
+            # Optimal detection size for accuracy vs speed.
+            # On GPU we can still lower this a bit from 960 to 800 to reduce latency.
+            det_size = (800, 800) if gpu_mode else (640, 640)
             self.app.prepare(ctx_id=0 if gpu_mode else -1, det_size=det_size, det_thresh=0.5)
 
-            print(f"✅ Enhanced face recognition initialized in {'GPU' if gpu_mode else 'CPU'} mode")
+            # One-time warm-up pass to amortize first inference latency.
+            try:
+                dummy_h, dummy_w = self.processing_resolution[1], self.processing_resolution[0]
+                dummy_frame = np.zeros((dummy_h, dummy_w, 3), dtype=np.uint8)
+                _ = self.app.get(dummy_frame)
+            except Exception as e:
+                print(f"⚠️ Warm-up detection failed: {e}")
+
+            # Log which providers actually ended up active for debugging performance issues.
+            try:
+                active_providers = getattr(self.app, "providers", None)
+            except Exception:
+                active_providers = None
+
+            print(f"✅ Enhanced face recognition initialized in {'GPU' if gpu_mode else 'CPU'} mode | providers={active_providers}")
 
         except Exception as e:
-            print(f"Failed to initialize face recognition: {e}")
-            raise
+            # If GPU init fails, fall back to CPU to keep app running
+            print(f"⚠️ GPU init failed ({e}); falling back to CPU providers")
+            self.gpu_mode = False
+            self.app = FaceAnalysis(
+                allowed_modules=['detection', 'recognition'],
+                providers=['CPUExecutionProvider']
+            )
+            self.app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.5)
+            print("✅ Face recognition initialized in CPU mode (fallback)")
 
         # Load databases with performance optimization
         self.customer_database = {}
@@ -128,12 +153,12 @@ class FaceRecognitionEngine:
             self.staff_database = {}
 
     def ultra_optimized_face_detection(self, frame):
-        """Ultra-optimized face detection with proper threshold"""
+        """Ultra-optimized face detection with proper threshold - processes ANY frame immediately"""
         try:
             if frame is None:
                 return []
 
-            # Process frame with optimal resolution
+            # Process frame with optimal resolution - works on ANY frame size/resolution
             height, width = frame.shape[:2]
             scale_factor = min(self.processing_resolution[0] / width, self.processing_resolution[1] / height)
 
@@ -145,7 +170,8 @@ class FaceRecognitionEngine:
                 processed_frame = frame
                 scale_factor = 1.0
 
-            # InsightFace expects BGR images
+            # CRITICAL: InsightFace detection on ANY frame - starts immediately from first frame
+            # No delays, no frame skipping - processes every frame captured by camera
             faces = self.app.get(processed_frame)
 
             detections = []
@@ -331,18 +357,30 @@ class FaceRecognitionEngine:
             return None, 0.0
 
     def identify_person(self, embedding):
-        """Identify if person is customer or staff with ultra-optimization"""
+        """Identify if person is customer or staff with ultra-optimization and enhanced staff verification"""
         try:
-            # Check staff first (higher priority)
-            staff_match = self._match_against_database(embedding, self.staff_database)
-            if staff_match[1] > 0.65:  # Higher threshold for staff
-                return 'staff', staff_match[0], staff_match[1]
+            # CRITICAL: Check staff first (higher priority) - this ensures we properly verify staff
+            # before marking anyone as unknown
+            if len(self.staff_database) > 0:
+                staff_match = self._match_against_database(embedding, self.staff_database)
+                staff_id, staff_confidence = staff_match
+                
+                # Use slightly lower threshold (0.60) to catch more staff while maintaining accuracy
+                # This helps ensure we don't miss staff members who should be recognized
+                if staff_id and staff_confidence >= 0.60:  # Lowered from 0.65 to 0.60 for better detection
+                    # Additional verification: ensure staff_id is valid
+                    if staff_id in self.staff_database:
+                        return 'staff', staff_id, staff_confidence
+                    else:
+                        print(f"⚠️ Staff ID {staff_id} not found in database despite match")
+            
+            # Only check customers if NOT staff (to avoid false positives)
+            if len(self.customer_database) > 0:
+                customer_id, confidence = self.lightning_fast_customer_identification(embedding)
+                if customer_id and confidence > self.confidence_threshold:
+                    return 'customer', customer_id, confidence
 
-            # Check customers with lightning-fast method
-            customer_id, confidence = self.lightning_fast_customer_identification(embedding)
-            if customer_id and confidence > self.confidence_threshold:
-                return 'customer', customer_id, confidence
-
+            # Return unknown only after checking both staff and customers
             return 'unknown', None, 0.0
 
         except Exception as e:

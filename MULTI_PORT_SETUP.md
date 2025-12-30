@@ -26,10 +26,24 @@ python web_app.py --port 8000 --mode checkout
 ```
 
 ## Features
-- ✅ **Separate Ports**: Check-In on port 5000, Check-Out on port 8000
+- ✅ **Separate Ports**: Check-In on port 5000, Check-Out on port 8000 (configurable)
 - ✅ **Shared Database**: Both servers use the same `data/factory_attendance.db`
 - ✅ **Mode Locked**: Each server is locked to its specific mode (cannot be changed)
 - ✅ **Independent Operation**: Both servers can run simultaneously
+- ✅ **Configurable Ports**: Ports can be changed in `config/system_config.json`
+
+## Configuring Ports
+
+You can customize the ports by editing `config/system_config.json`:
+
+```json
+{
+    "checkin_port": 5000,
+    "checkout_port": 8000
+}
+```
+
+Change these values to any available ports (e.g., 5001, 8001, etc.) and restart the servers.
 
 ## Network Access
 Both servers listen on all network interfaces (`0.0.0.0`), so they can be accessed from other devices on your network:
@@ -40,5 +54,7 @@ Both servers listen on all network interfaces (`0.0.0.0`), so they can be access
 - Both servers share the same database, so attendance data is synchronized
 - Each server is locked to its mode and cannot be switched via the web interface
 - You can run both servers simultaneously on the same machine
-- Make sure both ports (5000 and 8000) are not blocked by your firewall
+- Make sure both ports are not blocked by your firewall
+- **Camera Access**: If using a USB camera, only one server should access it at a time. RTSP cameras typically support multiple connections.
+- **Port Conflicts**: If a port is already in use, change it in `config/system_config.json` and restart the server
 

@@ -67,6 +67,23 @@ class ImpexAttendanceDashboard:
         self.auto_register_enabled = True
         self.registered_today = set()
         
+        # Entry/Exit tracking - only capture when person leaves and returns
+        self.person_track_status = {}  # track_id -> {'in_frame': bool, 'last_seen': time, 'captured': bool, 'bbox': [...]}
+        self.person_track_timeout = 2.0  # Person considered "left" after 2 seconds of no detection
+        
+        # Unknown entry tracking - track unknown persons to avoid duplicates
+        self.unknown_track_status = {}  # track_id -> {'in_frame': bool, 'last_seen': time, 'captured': bool, 'bbox': [...]}
+        
+        # Motion detection for catching fast-moving persons (even without face detection)
+        self.motion_detector = None
+        self.background_subtractor = None
+        self.last_frame_for_motion = None
+        self.motion_detection_enabled = True
+        self.motion_capture_interval = 0.2  # Capture motion every 0.2 seconds (very fast for fast-moving persons)
+        self.last_motion_capture_time = {}  # motion_id -> last capture time
+        self.last_motion_detection_time = 0  # Last time motion detection ran
+        self.motion_detection_interval = 0.03  # Run motion detection every 0.03s (~33 FPS) - very fast
+        
         # Employee ID mapping - MUST be initialized early
         self.employee_id_map = {}
         
@@ -398,6 +415,25 @@ class ImpexAttendanceDashboard:
             self.face_engine = FaceRecognitionEngine(gpu_mode=gpu_mode)
             self.tracking_manager = TrackingManager(gpu_mode=gpu_mode)
             
+            # Initialize motion detection for catching fast-moving persons
+            if self.motion_detection_enabled:
+                try:
+                    # Use MOG2 background subtractor for motion detection
+                    self.background_subtractor = cv2.createBackgroundSubtractorMOG2(
+                        history=500, varThreshold=50, detectShadows=True
+                    )
+                    print("✅ Motion detection initialized for catching fast-moving persons")
+                except Exception as e:
+                    print(f"⚠️ Motion detection initialization failed: {e}")
+                    self.motion_detection_enabled = False
+            
+            # Verify face engine is ready before starting camera
+            if self.face_engine is None:
+                messagebox.showerror("Engine Error", "Face recognition engine failed to initialize")
+                return
+            
+            print("✅ Face recognition engine ready - Detection will start on first frame")
+            
             # Start camera
             if not self.camera_manager.start_camera():
                 messagebox.showerror("Camera Error", "Failed to start camera")
@@ -408,7 +444,7 @@ class ImpexAttendanceDashboard:
             self.stop_btn.config(state=tk.NORMAL)
             self.camera_status_label.config(text="Camera: Connected", fg='green')
             
-            # Start processing thread
+            # Start processing thread - Detection will start immediately on first frame
             self.process_thread = threading.Thread(target=self.process_video, daemon=True)
             self.process_thread.start()
             
@@ -416,7 +452,7 @@ class ImpexAttendanceDashboard:
             self.display_thread = threading.Thread(target=self.display_video, daemon=True)
             self.display_thread.start()
             
-            print("✅ Attendance recognition started")
+            print("✅ Attendance recognition started - Face detection active on all frames")
             
         except Exception as e:
             print(f"❌ Start error: {e}")
@@ -431,10 +467,66 @@ class ImpexAttendanceDashboard:
         self.camera_status_label.config(text="Camera: Disconnected", fg='red')
         print("⏹ Recognition stopped")
     
+    def _is_good_frame(self, frame, strict=True):
+        """Check if frame is good quality for processing (not too blurry or dark)
+        
+        Args:
+            frame: Video frame to check
+            strict: If True, use strict quality checks. If False, use lenient checks for unknown detection.
+        """
+        if frame is None:
+            return False
+        
+        # Convert to grayscale for analysis
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+        
+        # Check brightness (avoid too dark frames)
+        mean_brightness = np.mean(gray)
+        
+        if strict:
+            # Strict quality check for staff recognition (needs good quality)
+            if mean_brightness < 30:  # Too dark
+                return False
+            
+            # Check blur using Laplacian variance (simple and fast)
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if laplacian_var < 50:  # Too blurry
+                return False
+        else:
+            # Lenient quality check for unknown person detection
+            # Allow slightly darker and blurrier frames to catch moving persons
+            if mean_brightness < 15:  # Only reject very dark frames (was 30)
+                return False
+            
+            # Check blur using Laplacian variance - more lenient
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if laplacian_var < 20:  # Only reject very blurry frames (was 50)
+                return False
+        
+        return True
+
     def process_video(self):
-        """Process video frames for face recognition - OPTIMIZED FOR HIGH FPS"""
+        """Process video frames for face recognition - OPTIMIZED WITH SMART FRAME SKIPPING"""
         if not hasattr(self, 'last_processed'):
             self.last_processed = {}
+        
+        # Initialize frame counter to track that detection starts from frame 1
+        frame_counter = 0
+        
+        # FPS tracking for terminal output
+        fps_counter = 0
+        fps_start_time = time.time()
+        last_fps_print = time.time()
+        processed_frames = 0
+        
+        # Frame skipping configuration - REDUCED for better unknown person capture
+        FRAME_SKIP_INTERVAL = 2  # Process every 2nd frame for detection (was 3)
+        MIN_PROCESS_INTERVAL = 0.05  # Minimum 0.05s between detections (20 FPS max detection rate, was 0.1s)
+        last_detection_time = 0
+        
+        # Unknown person capture configuration
+        UNKNOWN_CAPTURE_INTERVAL = 2.0  # Capture same unknown person every 2 seconds if still in frame
+        last_unknown_capture_time = {}  # track_id -> last capture time
         
         while self.running:
             try:
@@ -443,48 +535,367 @@ class ImpexAttendanceDashboard:
                     time.sleep(0.01)  # Ultra-fast check
                     continue
                 
+                frame_counter += 1
+                fps_counter += 1
+                
+                # Log first frame to confirm detection starts immediately
+                if frame_counter == 1:
+                    print("✅ Face detection started - Processing first frame from camera")
+                
                 with self.frame_lock:
                     self.current_frame = frame.copy()
                 
-                # Detect faces and recognize - process every frame for smooth detection
-                detections = self.face_engine.detect_faces(frame)
+                # Smart frame skipping: only process good frames at intervals
+                current_time = time.time()
                 
-                # Store detection info for drawing - ALL faces shown
-                detection_info = []
+                # Use strict quality check for normal processing
+                is_good_quality = self._is_good_frame(frame, strict=True)
+                # Use lenient quality check for unknown detection (to catch moving persons)
+                is_acceptable_quality = self._is_good_frame(frame, strict=False)
                 
-                for detection in detections:
-                    bbox = detection['bbox']
-                    embedding = detection['embedding']
-                    det_confidence = detection.get('confidence', 0.0)
+                should_process = (
+                    frame_counter % FRAME_SKIP_INTERVAL == 0 and  # Every Nth frame
+                    (current_time - last_detection_time) >= MIN_PROCESS_INTERVAL and  # Time-based throttling
+                    is_good_quality  # Quality check for staff recognition
+                )
+                
+                # Also process frames with acceptable quality for unknown detection
+                # This ensures we don't miss unknown persons due to quality checks
+                # IMPORTANT: Process lenient quality frames to capture moving/blurry unknown persons
+                # We process these even alongside good quality frames to ensure no misses
+                should_process_for_unknown = (
+                    frame_counter % FRAME_SKIP_INTERVAL == 0 and  # Every Nth frame
+                    (current_time - last_detection_time) >= MIN_PROCESS_INTERVAL and  # Time-based throttling
+                    is_acceptable_quality  # Acceptable quality (includes both good and lenient)
+                )
+                
+                # CRITICAL: Motion detection runs on EVERY frame (independent of face detection)
+                # This ensures we catch fast-moving persons even when face detection doesn't run
+                if self.motion_detection_enabled and self.background_subtractor is not None:
+                    time_since_last_motion = current_time - self.last_motion_detection_time
+                    if time_since_last_motion >= self.motion_detection_interval:
+                        # Run motion detection (no quality checks - works on any frame)
+                        # Initialize empty sets if face detection hasn't run yet
+                        current_track_ids_for_motion = current_track_ids if 'current_track_ids' in locals() else set()
+                        current_staff_ids_for_motion = current_staff_ids_detected if 'current_staff_ids_detected' in locals() else set()
+                        self.detect_and_capture_motion(frame, current_time, current_track_ids_for_motion, current_staff_ids_for_motion)
+                        self.last_motion_detection_time = current_time
+                
+                # Detect faces only on selected frames
+                if should_process or should_process_for_unknown:
+                    processed_frames += 1
+                    last_detection_time = current_time
                     
-                    # Check if this is a staff member
-                    person_type, person_id, rec_confidence = self.face_engine.identify_person(embedding)
+                    # Mark if this is a lenient quality frame (for unknown detection only)
+                    is_lenient_quality_frame = should_process_for_unknown and not should_process
                     
-                    # Store detection info for drawing - ALL faces (even unrecognized)
-                    info = {
-                        'bbox': bbox,
-                        'confidence': det_confidence,
-                        'person_type': person_type,
-                        'person_id': person_id,
-                        'recognition_confidence': rec_confidence,
-                        'detected': True
-                    }
-                    detection_info.append(info)
+                    detections = self.face_engine.detect_faces(frame)
                     
-                    # Process attendance if staff member recognized (with debouncing)
-                    if person_type == 'staff' and person_id and rec_confidence >= 0.55:
-                        current_time = time.time()
-                        # Debounce: only process once per 3 seconds per staff_id
-                        last_time = self.last_processed.get(person_id, 0)
-                        if current_time - last_time > 3.0:  # 3 second debounce
-                            self.last_processed[person_id] = current_time
-                            self.process_attendance(person_id, frame, bbox, rec_confidence)
+                    # Track currently detected persons
+                    current_track_ids = set()
+                    current_staff_ids_detected = set()  # Track all detected staff (even if not shown)
+                    detection_info = []  # Will only contain detections to show (after entry/exit logic)
+                    unknown_detections = []  # Store unknown detections for processing
+                    
+                    for detection in detections:
+                        bbox = detection['bbox']
+                        embedding = detection['embedding']
+                        det_confidence = detection.get('confidence', 0.0)
+                        
+                        # Generate track ID based on face position and size
+                        x1, y1, x2, y2 = map(int, bbox)
+                        face_center_x = (x1 + x2) // 2
+                        face_center_y = (y1 + y2) // 2
+                        face_size = (x2 - x1) * (y2 - y1)
+                        track_id = hash((face_center_x // 50, face_center_y // 50, face_size // 1000))
+                        track_id = abs(track_id) % 1000000
+                        current_track_ids.add(track_id)
+                        
+                        # CRITICAL: Check if this is a staff member FIRST
+                        # This ensures we properly verify staff before marking as unknown
+                        # For lenient quality frames, we still try to identify but prioritize unknown capture
+                        person_type, person_id, rec_confidence = self.face_engine.identify_person(embedding)
+                        
+                        # Enhanced staff verification: double-check with higher threshold
+                        # For lenient quality frames, use slightly lower threshold to avoid false positives
+                        is_confirmed_staff = False
+                        if person_type == 'staff' and person_id:
+                            # Additional verification: check if staff_id exists in database
+                            staff_info = self.db_manager.get_staff_info(person_id)
+                            # Use lower threshold for lenient quality frames to be more conservative
+                            min_confidence = 0.50 if is_lenient_quality_frame else 0.55
+                            if staff_info and rec_confidence >= min_confidence:
+                                is_confirmed_staff = True
+                                print(f"✅ Confirmed Staff: {person_id} (confidence: {rec_confidence:.3f}, quality: {'lenient' if is_lenient_quality_frame else 'good'})")
+                        
+                        # Update tracking status
+                        if is_confirmed_staff:
+                            # Track that this staff member is currently detected
+                            current_staff_ids_detected.add(person_id)
+                            
+                            # Staff member detected - use staff_id as track key
+                            staff_track_key = f"staff_{person_id}"
+                            
+                            # Get or create track status
+                            if staff_track_key not in self.person_track_status:
+                                self.person_track_status[staff_track_key] = {
+                                    'in_frame': False,
+                                    'last_seen': 0,
+                                    'captured': False,
+                                    'bbox': None,
+                                    'track_id': track_id
+                                }
+                            
+                            track_status = self.person_track_status[staff_track_key]
+                            track_status['track_id'] = track_id  # Update track_id
+                            
+                            # If person was not in frame before (just entered or returned)
+                            if not track_status['in_frame']:
+                                # Check if this is a return (was captured before)
+                                if track_status['captured']:
+                                    # Person returned - reset capture flag to allow new capture
+                                    print(f"✅ Staff {person_id} returned to frame - capturing attendance")
+                                    track_status['captured'] = False
+                                    track_status['in_frame'] = True
+                                    track_status['last_seen'] = current_time
+                                    track_status['bbox'] = bbox
+                                    
+                                    # Now capture and process attendance
+                                    self.process_attendance(person_id, frame, bbox, rec_confidence)
+                                    
+                                    # Show detection on screen (only after return) - with timestamp
+                                    info = {
+                                        'bbox': bbox,
+                                        'confidence': det_confidence,
+                                        'person_type': person_type,
+                                        'person_id': person_id,
+                                        'recognition_confidence': rec_confidence,
+                                        'detected': True,
+                                        'show_until': current_time + 2.0  # Show for 2 seconds, then hide
+                                    }
+                                    detection_info.append(info)
+                                else:
+                                    # First time seeing this person - mark as in frame but don't capture yet
+                                    print(f"👁️ Staff {person_id} detected in frame - waiting for them to leave before capture")
+                                    track_status['in_frame'] = True
+                                    track_status['last_seen'] = current_time
+                                    track_status['bbox'] = bbox
+                                    # Don't show on screen or capture yet - wait for them to leave
+                            else:
+                                # Person still in frame - update last seen time
+                                track_status['last_seen'] = current_time
+                                track_status['bbox'] = bbox
+                                # Don't show on screen - they're still in frame
+                                # Remove from current_detections if they were showing before
+                                with self.frame_lock:
+                                    self.current_detections = [
+                                        d for d in self.current_detections 
+                                        if d.get('person_id') != person_id
+                                    ]
+                        
+                        # Handle unknown persons - anyone NOT confirmed as staff
+                        # This includes: unknown, customer, or staff with low confidence/no ID
+                        # IMPORTANT: For lenient quality frames, we prioritize capturing unknown persons
+                        # even if staff recognition is uncertain
+                        else:
+                            # Unknown person - capture EVERY time they pass (not just on entry/exit)
+                            # This works for both good quality and lenient quality frames
+                            unknown_track_key = f"unknown_{track_id}"
+                            
+                            # Log if this is from a lenient quality frame
+                            if is_lenient_quality_frame:
+                                print(f"📸 Processing unknown on lenient quality frame (may be moving/blurry)")
+                            
+                            if unknown_track_key not in self.unknown_track_status:
+                                self.unknown_track_status[unknown_track_key] = {
+                                    'in_frame': False,
+                                    'last_seen': 0,
+                                    'captured': False,
+                                    'bbox': bbox,
+                                    'face_confidence': det_confidence,
+                                    'recognition_confidence': rec_confidence,
+                                    'track_id': track_id,
+                                    'first_detected': current_time
+                                }
+                            
+                            track_status = self.unknown_track_status[unknown_track_key]
+                            track_status['track_id'] = track_id  # Update track_id
+                            track_status['bbox'] = bbox
+                            track_status['face_confidence'] = det_confidence
+                            track_status['recognition_confidence'] = rec_confidence
+                            
+                            # IMPROVED: Capture unknown person immediately when detected
+                            # Check if enough time has passed since last capture (to avoid duplicates)
+                            last_capture = last_unknown_capture_time.get(track_id, 0)
+                            time_since_last_capture = current_time - last_capture
+                            
+                            # Capture if:
+                            # 1. First time seeing this person (not in frame before), OR
+                            # 2. Person is in frame but enough time has passed (UNKNOWN_CAPTURE_INTERVAL)
+                            should_capture = False
+                            
+                            if not track_status['in_frame']:
+                                # Person just entered frame - capture immediately
+                                should_capture = True
+                                track_status['in_frame'] = True
+                                track_status['first_detected'] = current_time
+                                print(f"📸 Unknown person detected (NEW): type={person_type}, track_id={track_id}, conf={rec_confidence:.2f} - capturing immediately")
+                            elif time_since_last_capture >= UNKNOWN_CAPTURE_INTERVAL:
+                                # Person still in frame but enough time passed - capture again
+                                should_capture = True
+                                print(f"📸 Unknown person detected (REPEAT): type={person_type}, track_id={track_id}, conf={rec_confidence:.2f} - capturing again (interval: {time_since_last_capture:.1f}s)")
+                            
+                            if should_capture:
+                                # Update last capture time
+                                last_unknown_capture_time[track_id] = current_time
+                                track_status['last_seen'] = current_time
+                                
+                                # Capture unknown entry immediately (save to database)
+                                unknown_detections.append({
+                                    'bbox': bbox,
+                                    'face_confidence': det_confidence,
+                                    'recognition_confidence': rec_confidence,
+                                    'has_face': True,
+                                    'track_id': track_id,
+                                    'person_type': person_type
+                                })
+                                
+                                # Also show on screen briefly
+                                info = {
+                                    'bbox': bbox,
+                                    'confidence': det_confidence,
+                                    'person_type': 'unknown',
+                                    'person_id': None,
+                                    'recognition_confidence': rec_confidence,
+                                    'detected': True,
+                                    'show_until': current_time + 3.0  # Show for 3 seconds
+                                }
+                                detection_info.append(info)
+                            else:
+                                # Update last seen but don't capture yet (too soon)
+                                track_status['last_seen'] = current_time
+                    
+                    # Check for persons who left the frame (not detected in current cycle)
+                    # For staff members
+                    for track_key, status in list(self.person_track_status.items()):
+                        if track_key.startswith('staff_'):
+                            staff_id = track_key.replace('staff_', '')
+                            if staff_id in current_staff_ids_detected:
+                                # Staff member is detected - update last seen if in frame
+                                if status['in_frame']:
+                                    status['last_seen'] = current_time
+                            else:
+                                # Staff member NOT detected in current cycle
+                                if status['in_frame']:
+                                    time_since_last_seen = current_time - status['last_seen']
+                                    if time_since_last_seen > self.person_track_timeout:
+                                        # Person has been gone long enough - mark as left
+                                        status['in_frame'] = False
+                                        if not status['captured']:
+                                            status['captured'] = True
+                                            print(f"⏱️ Staff {staff_id} left frame - ready for capture on return")
+                    
+                    # For unknown persons
+                    for track_key, status in list(self.unknown_track_status.items()):
+                        track_id = status.get('track_id')
+                        if track_id and track_id in current_track_ids:
+                            # Unknown person is detected - update last seen if in frame
+                            if status['in_frame']:
+                                status['last_seen'] = current_time
+                        else:
+                            # Unknown person NOT detected in current cycle
+                            if track_id and status['in_frame']:
+                                time_since_last_seen = current_time - status['last_seen']
+                                if time_since_last_seen > self.person_track_timeout:
+                                    # Unknown person left frame
+                                    status['in_frame'] = False
+                                    if not status['captured']:
+                                        status['captured'] = True
+                                        print(f"⏱️ Unknown person (track {track_id}) left frame - ready for capture on return")
+                    
+                    # Process unknown entries immediately (captured when detected)
+                    if unknown_detections:
+                        print(f"📝 Processing {len(unknown_detections)} unknown entry/entries...")
+                        self.process_unknown_entries(frame, unknown_detections, current_time)
+                        
+                        # Clean up old capture times (keep only recent ones)
+                        current_time_cleanup = current_time
+                        tracks_to_remove = [
+                            tid for tid, last_time in last_unknown_capture_time.items()
+                            if current_time_cleanup - last_time > 60.0  # Remove if not seen for 60 seconds
+                        ]
+                        for tid in tracks_to_remove:
+                            last_unknown_capture_time.pop(tid, None)
+                    
+                    # Motion detection already runs above on every frame
+                    # This section is kept for backward compatibility but motion detection
+                    # is now handled earlier in the loop for maximum speed
+                    
+                    # Store detections for display - only show persons who just returned
+                    # Also filter out old detections that exceeded their display time
+                    current_time_check = current_time
+                    filtered_info = []
+                    for det in detection_info:
+                        show_until = det.get('show_until', current_time_check + 10.0)  # Default 10s if no timestamp
+                        if current_time_check < show_until:
+                            filtered_info.append(det)
+                    detection_info = filtered_info
+                    
+                    with self.frame_lock:
+                        # Also filter existing detections by show_until time
+                        existing_filtered = []
+                        for det in self.current_detections:
+                            show_until = det.get('show_until', current_time_check + 10.0)
+                            if current_time_check < show_until:
+                                existing_filtered.append(det)
+                        # Combine with new detections (new ones take priority)
+                        combined_detections = existing_filtered + detection_info
+                        # Remove duplicates by person_id or track_id
+                        seen = set()
+                        unique_detections = []
+                        for det in combined_detections:
+                            key = det.get('person_id') or f"track_{det.get('bbox', [0,0,0,0])[0]}"
+                            if key not in seen:
+                                seen.add(key)
+                                unique_detections.append(det)
+                        self.current_detections = unique_detections
+                else:
+                    # If not processing, filter detections by show_until time and in_frame status
+                    with self.frame_lock:
+                        filtered_detections = []
+                        current_time_check = current_time
+                        for det in self.current_detections:
+                            # Check if detection has expired
+                            show_until = det.get('show_until', current_time_check + 10.0)
+                            if current_time_check >= show_until:
+                                continue  # Skip expired detections
+                            
+                            # Check if person is still in frame (shouldn't show)
+                            person_id = det.get('person_id')
+                            if person_id:
+                                staff_track_key = f"staff_{person_id}"
+                                if staff_track_key in self.person_track_status:
+                                    track_status = self.person_track_status[staff_track_key]
+                                    # Don't show if person is currently in frame
+                                    if track_status['in_frame']:
+                                        continue  # Skip - person is still in frame
+                            
+                            filtered_detections.append(det)
+                        self.current_detections = filtered_detections
                 
-                # Store detections for display - ALWAYS show all detections
-                with self.frame_lock:
-                    self.current_detections = detection_info
+                # Calculate and print FPS to terminal every second
+                if current_time - last_fps_print >= 1.0:
+                    elapsed = current_time - fps_start_time
+                    if elapsed > 0:
+                        fps = fps_counter / elapsed
+                        detection_fps = processed_frames / elapsed if processed_frames > 0 else 0
+                        print(f"📊 FPS: {fps:.1f} | Detection FPS: {detection_fps:.1f} | Total: {frame_counter} | Processed: {processed_frames}")
+                        fps_counter = 0
+                        processed_frames = 0
+                        fps_start_time = current_time
+                    last_fps_print = current_time
                 
-                time.sleep(0.01)  # ~100 FPS processing rate - ultra fast
+                time.sleep(0.01)  # Fast frame capture for smooth display
                 
             except Exception as e:
                 print(f"Processing error: {e}")
@@ -495,6 +906,11 @@ class ImpexAttendanceDashboard:
         try:
             mode = self.attendance_mode.get()
             now = datetime.now()
+            
+            # Mark this staff member as captured (so they won't be captured again until they leave and return)
+            staff_track_key = f"staff_{staff_id}"
+            if staff_track_key in self.person_track_status:
+                self.person_track_status[staff_track_key]['captured'] = True
             
             # Capture photo for display
             x1, y1, x2, y2 = map(int, bbox)
@@ -523,6 +939,326 @@ class ImpexAttendanceDashboard:
             
         except Exception as e:
             print(f"Attendance processing error: {e}")
+    
+    def detect_and_capture_motion(self, frame, current_time, current_face_track_ids, current_staff_ids):
+        """Detect motion and capture persons even when face detection fails (for fast-moving persons)
+        
+        OPTIMIZED for speed - runs very frequently to catch fast-moving persons
+        """
+        try:
+            if frame is None or self.background_subtractor is None:
+                return
+            
+            # OPTIMIZED: Resize frame for faster processing (motion detection doesn't need full resolution)
+            # Use smaller resolution for motion detection to speed it up
+            h, w = frame.shape[:2]
+            scale = 1.0
+            if w > 640:  # Only resize if frame is large
+                scale = 640.0 / w
+                new_w = 640
+                new_h = int(h * scale)
+                frame_small = cv2.resize(frame, (new_w, new_h))
+            else:
+                frame_small = frame
+            
+            # Process frame for motion detection (faster on smaller frame)
+            gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY) if len(frame_small.shape) == 3 else frame_small
+            
+            # Apply background subtraction (fast operation)
+            fg_mask = self.background_subtractor.apply(gray)
+            
+            # OPTIMIZED: Faster noise removal with smaller kernel
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # Smaller kernel = faster
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+            
+            # Find contours (moving objects) - OPTIMIZED for speed
+            contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Use small frame dimensions for area calculations
+            h_small, w_small = frame_small.shape[:2]
+            min_area = (w_small * h_small) * 0.01  # At least 1% of frame area
+            max_area = (w_small * h_small) * 0.5   # At most 50% of frame area
+            
+            motion_detections = []
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                
+                # Filter by size (person-sized objects)
+                if area < min_area or area > max_area:
+                    continue
+                
+                # Get bounding box (on small frame)
+                x, y, bw, bh = cv2.boundingRect(contour)
+                
+                # Scale back to original frame coordinates
+                x = int(x / scale)
+                y = int(y / scale)
+                bw = int(bw / scale)
+                bh = int(bh / scale)
+                
+                # Skip if too small (not a person) - use scaled dimensions
+                if bw < 40 or bh < 80:  # Slightly smaller threshold for faster detection
+                    continue
+                
+                # Calculate center and generate motion ID
+                center_x = x + bw // 2
+                center_y = y + bh // 2
+                motion_id = hash((center_x // 100, center_y // 100, area // 1000))
+                motion_id = abs(motion_id) % 1000000
+                
+                # Check if this motion corresponds to a known face track or staff
+                # If it does, skip (already handled by face detection)
+                is_known_face = False
+                for face_track_id in current_face_track_ids:
+                    # Check if motion is near any face detection
+                    # This is approximate - if motion center is close to face area, assume it's the same person
+                    if abs(motion_id - face_track_id) < 10000:  # Rough check
+                        is_known_face = True
+                        break
+                
+                if is_known_face:
+                    continue  # Skip - already handled by face detection
+                
+                # Check if we've captured this motion recently
+                last_capture = self.last_motion_capture_time.get(motion_id, 0)
+                time_since_capture = current_time - last_capture
+                
+                if time_since_capture < self.motion_capture_interval:
+                    continue  # Too soon to capture again
+                
+                # This is a new motion detection without face - capture it
+                bbox = [x, y, x + bw, y + bh]
+                
+                # OPTIMIZED: Try face detection on full frame (faster than ROI extraction)
+                # But limit to motion region to speed up
+                # Expand ROI slightly to ensure we catch the face
+                expand = 20
+                roi_x1 = max(0, x - expand)
+                roi_y1 = max(0, y - expand)
+                roi_x2 = min(frame.shape[1], x + bw + expand)
+                roi_y2 = min(frame.shape[0], y + bh + expand)
+                roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                
+                has_face = False
+                face_confidence = 0.0
+                face_detections = []
+                
+                if roi.size > 0 and roi.shape[0] > 30 and roi.shape[1] > 30:
+                    # Try face detection on this region (fast - only on motion area)
+                    try:
+                        face_detections = self.face_engine.detect_faces(roi)
+                        has_face = len(face_detections) > 0
+                        face_confidence = face_detections[0]['confidence'] if face_detections else 0.0
+                    except:
+                        # If face detection fails, continue with motion detection
+                        pass
+                    
+                    # Adjust bbox to frame coordinates if face was detected in ROI
+                    if face_detections:
+                        face_bbox_roi = face_detections[0]['bbox']
+                        face_bbox = [
+                            roi_x1 + int(face_bbox_roi[0]),
+                            roi_y1 + int(face_bbox_roi[1]),
+                            roi_x1 + int(face_bbox_roi[2]),
+                            roi_y1 + int(face_bbox_roi[3])
+                        ]
+                    else:
+                        face_bbox = None
+                    
+                    # OPTIMIZED: Quick staff check - only if face was detected
+                    # Skip staff check if no face (faster processing)
+                    person_type = 'unknown'
+                    rec_confidence = 0.0
+                    is_staff = False
+                    
+                    if face_detections:
+                        embedding = face_detections[0].get('embedding')
+                        if embedding is not None:
+                            # Quick staff identification
+                            person_type, person_id, rec_confidence = self.face_engine.identify_person(embedding)
+                            
+                            # Check if staff (lower threshold for motion detections)
+                            if person_type == 'staff' and person_id:
+                                staff_info = self.db_manager.get_staff_info(person_id)
+                                if staff_info and rec_confidence >= 0.45:  # Lower threshold for speed
+                                    is_staff = True
+                    
+                    # Skip if confirmed staff
+                    if is_staff:
+                        continue
+                    
+                    # This is NOT staff - capture as unknown entry
+                    print(f"🏃 Motion detected (no face/fast-moving): motion_id={motion_id}, has_face={has_face}, person_type={person_type}, conf={rec_confidence:.2f}")
+                    
+                    # Update capture time
+                    self.last_motion_capture_time[motion_id] = current_time
+                    
+                    # Capture as unknown entry
+                    motion_detections.append({
+                        'bbox': bbox,
+                        'face_bbox': face_bbox,
+                        'face_confidence': face_confidence,
+                        'recognition_confidence': rec_confidence,
+                        'has_face': has_face,
+                        'track_id': motion_id,
+                        'person_type': person_type,
+                        'motion_detected': True
+                    })
+            
+            # Process motion detections as unknown entries
+            if motion_detections:
+                print(f"📸 Capturing {len(motion_detections)} motion-based unknown entry/entries...")
+                self.process_unknown_entries(frame, motion_detections, current_time)
+                
+        except Exception as e:
+            print(f"❌ Motion detection error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def process_unknown_entries(self, frame, unknown_detections, current_time):
+        """Process and capture unknown entries (persons without recognized faces or with covered faces)"""
+        try:
+            h, w = frame.shape[:2]
+            system_mode = self.attendance_mode.get()
+            
+            for idx, detection in enumerate(unknown_detections):
+                # Handle both face-based and motion-based detections
+                # Motion detections have 'face_bbox' separate from 'bbox'
+                is_motion = detection.get('motion_detected', False)
+                
+                if is_motion:
+                    # Motion-based: use motion bbox for person, face_bbox for face (if available)
+                    person_bbox = detection['bbox']  # Full body bbox from motion
+                    face_bbox = detection.get('face_bbox', None)  # Face bbox if face was found
+                else:
+                    # Face-based: use face bbox
+                    person_bbox = detection['bbox']
+                    face_bbox = detection['bbox']
+                
+                face_confidence = detection.get('face_confidence', 0.0)
+                rec_confidence = detection.get('recognition_confidence', 0.0)
+                has_face = detection.get('has_face', True)
+                track_id = detection.get('track_id', 0)
+                person_type = detection.get('person_type', 'unknown')
+                
+                # Track ID should already be provided from the caller
+                if track_id == 0:
+                    # Fallback: generate track ID if not provided
+                    x1, y1, x2, y2 = map(int, person_bbox)
+                    face_center_x = (x1 + x2) // 2
+                    face_center_y = (y1 + y2) // 2
+                    face_size = (x2 - x1) * (y2 - y1)
+                    track_id = hash((face_center_x // 50, face_center_y // 50, face_size // 1000))
+                    track_id = abs(track_id) % 1000000
+                
+                # Determine entry type and reason with enhanced checking
+                # Check if this is a motion-based detection (no face detected initially)
+                is_motion_detection = detection.get('motion_detected', False)
+                
+                entry_type = 'unknown_person'
+                reason = 'Face detected but not recognized as staff'
+                
+                # Enhanced reason determination
+                if is_motion_detection:
+                    # Motion-based detection (fast-moving person, face might not be detected)
+                    if has_face:
+                        entry_type = 'unknown_person'
+                        reason = f'Fast-moving person detected (motion-based), face found but not recognized as staff (confidence: {rec_confidence:.2f})'
+                    else:
+                        entry_type = 'no_face'
+                        reason = 'Fast-moving person detected (motion-based), no face detected - person moved too quickly'
+                elif person_type == 'customer':
+                    entry_type = 'customer'
+                    reason = 'Recognized as customer, not staff member'
+                elif face_confidence < 0.3:
+                    entry_type = 'covered_face'
+                    reason = 'Face partially covered or low detection confidence'
+                elif rec_confidence < 0.5 and rec_confidence > 0:
+                    entry_type = 'unknown_person'
+                    reason = f'Face detected but person not in staff database (confidence: {rec_confidence:.2f})'
+                elif rec_confidence == 0.0:
+                    entry_type = 'unknown_person'
+                    reason = 'Face detected but no match found in staff database'
+                elif not has_face:
+                    entry_type = 'no_face'
+                    reason = 'No face detected'
+                
+                # Expand bounding box to capture full body
+                # For motion detections, bbox is already full body, so use it directly
+                # For face detections, expand from face bbox
+                if is_motion and person_bbox:
+                    # Motion detection already has full body bbox
+                    body_x1, body_y1, body_x2, body_y2 = map(int, person_bbox)
+                    # Use face_bbox if available, otherwise use person_bbox center
+                    if face_bbox:
+                        x1, y1, x2, y2 = map(int, face_bbox)
+                    else:
+                        # No face detected - use center of person bbox as approximate face location
+                        center_x = (body_x1 + body_x2) // 2
+                        center_y = body_y1 + (body_y2 - body_y1) // 7  # Face is about 1/7 from top
+                        face_size = min((body_x2 - body_x1) // 3, (body_y2 - body_y1) // 4)
+                        x1, y1 = center_x - face_size, center_y - face_size
+                        x2, y2 = center_x + face_size, center_y + face_size
+                else:
+                    # Face detection - expand from face bbox
+                    x1, y1, x2, y2 = map(int, face_bbox) if face_bbox else map(int, person_bbox)
+                    face_height = y2 - y1
+                    face_width = x2 - x1
+                    
+                    # Expand to capture full body (estimated)
+                    # Expand downward by ~6x face height, upward by ~1x, sideways by ~2x
+                    expand_down = int(face_height * 6)
+                    expand_up = int(face_height * 1.5)
+                    expand_sides = int(face_width * 1.5)
+                    
+                    # Calculate full body bounding box
+                    body_x1 = max(0, x1 - expand_sides)
+                    body_y1 = max(0, y1 - expand_up)
+                    body_x2 = min(w, x2 + expand_sides)
+                    body_y2 = min(h, y2 + expand_down)
+                
+                # Extract full body image
+                full_body_image = frame[body_y1:body_y2, body_x1:body_x2].copy()
+                
+                # Make sure we have a valid image
+                if full_body_image.size == 0 or full_body_image.shape[0] < 50 or full_body_image.shape[1] < 50:
+                    # Fallback: use person bbox directly
+                    body_x1, body_y1, body_x2, body_y2 = map(int, person_bbox)
+                    full_body_image = frame[body_y1:body_y2, body_x1:body_x2].copy()
+                
+                # Record unknown entry in database
+                # Use face_bbox if available, otherwise use approximate face location
+                face_bbox_for_db = [x1, y1, x2, y2] if (face_bbox or not is_motion) else None
+                
+                print(f"💾 Attempting to record unknown entry: Track ID {track_id}, Type: {entry_type}, Motion: {is_motion}")
+                entry_id = self.db_manager.record_unknown_entry(
+                    track_id=track_id,
+                    entry_type=entry_type,
+                    frame_image=full_body_image,
+                    face_bbox=face_bbox_for_db,
+                    person_bbox=[body_x1, body_y1, body_x2, body_y2],
+                    face_detected=has_face,
+                    face_confidence=float(face_confidence),
+                    recognition_confidence=float(rec_confidence),
+                    reason=reason,
+                    system_mode=system_mode
+                )
+                
+                if entry_id:
+                    # Mark this track as captured (so they won't be captured again until they leave and return)
+                    unknown_track_key = f"unknown_{track_id}"
+                    if unknown_track_key in self.unknown_track_status:
+                        self.unknown_track_status[unknown_track_key]['captured'] = True
+                    print(f"✅ Unknown entry SUCCESSFULLY recorded in database: Entry ID {entry_id}, Track ID {track_id}, Type: {entry_type}, Reason: {reason}")
+                else:
+                    print(f"❌ FAILED to record unknown entry in database: Track ID {track_id}, Type: {entry_type}")
+                
+        except Exception as e:
+            print(f"❌ Error processing unknown entries: {e}")
+            import traceback
+            traceback.print_exc()
     
     def record_checkin(self, staff_id, check_time, confidence):
         """Record check-in"""
